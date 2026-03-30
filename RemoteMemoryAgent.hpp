@@ -39,6 +39,11 @@ public:
 
     virtual void Resize(size_t new_count) = 0;
 
+    //! Free the current buffer and allocate a fresh one of size new_count.
+    //! Unlike Resize, this does NOT copy old data — use only when contents are not needed.
+    //! This avoids peak memory = old + new that Resize incurs.
+    virtual void Replace(size_t new_count) = 0;
+
     virtual void Free() = 0;
 };
 

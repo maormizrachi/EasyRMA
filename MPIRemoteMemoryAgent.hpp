@@ -173,6 +173,31 @@ public:
         this->count = new_count;
     }
 
+    void Replace(size_t new_count) override
+    {
+        MPI_Win_unlock_all(this->win);
+        MPI_Win_free(&this->win);
+        this->win = MPI_WIN_NULL;
+        this->ptr = nullptr;
+        this->count = 0;
+
+        MPI_Info info = detail::CreateDefaultRMAInfo();
+        int err = MPI_Win_allocate(static_cast<MPI_Aint>(new_count * sizeof(T)), 1, info, this->comm, &this->ptr, &this->win);
+        detail::CheckMPIError(err, "MPIRemoteMemoryAgent::Replace MPI_Win_allocate");
+        MPI_Info_free(&info);
+
+        if(this->ptr == nullptr and new_count > 0)
+        {
+            throw std::runtime_error("MPIRemoteMemoryAgent::Replace: MPI_Win_allocate returned null");
+        }
+
+        detail::ValidateUnifiedModel(this->win);
+        MPI_Win_set_errhandler(this->win, MPI_ERRORS_RETURN);
+        MPI_Win_lock_all(MPI_MODE_NOCHECK, this->win);
+
+        this->count = new_count;
+    }
+
     void Free() override
     {
         if(this->freed)

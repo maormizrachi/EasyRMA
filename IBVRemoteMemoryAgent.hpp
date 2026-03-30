@@ -324,6 +324,55 @@ public:
         this->ExchangeRemoteInfo();
     }
 
+    void Replace(size_t new_count) override
+    {
+        this->context.DrainCompletions();
+
+        if(this->staging_mr)
+        {
+            ibv_dereg_mr(this->staging_mr);
+            this->staging_mr = nullptr;
+        }
+        if(this->staging)
+        {
+            std::free(this->staging);
+            this->staging = nullptr;
+        }
+        this->staging_size = 0;
+
+        if(this->mr)
+        {
+            ibv_dereg_mr(this->mr);
+            this->mr = nullptr;
+        }
+        if(this->buffer)
+        {
+            std::free(this->buffer);
+            this->buffer = nullptr;
+        }
+        this->count = 0;
+
+        size_t new_alloc_size = new_count * sizeof(T);
+        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
+        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
+
+        this->buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
+        if(not this->buffer and new_count > 0)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::Replace: aligned_alloc failed");
+        }
+        std::memset(this->buffer, 0, new_aligned_size);
+
+        this->mr = ibv_reg_mr(this->context.GetPD(), this->buffer, new_aligned_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        if(not this->mr)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::Replace: ibv_reg_mr failed");
+        }
+
+        this->count = new_count;
+        this->ExchangeRemoteInfo();
+    }
+
     void Free() override
     {
         if(this->freed)
