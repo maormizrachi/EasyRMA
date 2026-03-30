@@ -65,9 +65,15 @@ class MPIRemoteMemoryAgent : public RemoteMemoryAgent<T>
 {
 public:
     MPIRemoteMemoryAgent(size_t count, MPI_Comm comm, MPI_Info info = MPI_INFO_NULL)
-        : count(count), comm(comm), ptr(nullptr), win(MPI_WIN_NULL), freed(false)
+        : count(count), comm(comm), ptr(nullptr), win(MPI_WIN_NULL), freed(false), owns_memory(true)
     {
         this->AllocateWindow(count, info);
+    }
+
+    MPIRemoteMemoryAgent(T *user_buffer, size_t count, MPI_Comm comm, MPI_Info info = MPI_INFO_NULL)
+        : count(count), comm(comm), ptr(user_buffer), win(MPI_WIN_NULL), freed(false), owns_memory(false)
+    {
+        this->CreateWindowOver(count, info);
     }
 
     ~MPIRemoteMemoryAgent() override
@@ -142,6 +148,11 @@ public:
 
     void Resize(size_t new_count) override
     {
+        if(not this->owns_memory)
+        {
+            throw std::runtime_error("MPIRemoteMemoryAgent::Resize: cannot resize user-supplied memory");
+        }
+
         size_t new_alloc = new_count * sizeof(T);
         if(new_alloc == 0) new_alloc = sizeof(T);
         size_t new_aligned = ((new_alloc + 63) / 64) * 64;
@@ -180,6 +191,11 @@ public:
 
     void Replace(size_t new_count) override
     {
+        if(not this->owns_memory)
+        {
+            throw std::runtime_error("MPIRemoteMemoryAgent::Replace: cannot replace user-supplied memory");
+        }
+
         MPI_Win_unlock_all(this->win);
         MPI_Win_free(&this->win);
         rma_detail::advise_dontneed(this->ptr, this->count * sizeof(T));
@@ -218,8 +234,11 @@ public:
         }
         MPI_Win_unlock_all(this->win);
         MPI_Win_free(&this->win);
-        rma_detail::advise_dontneed(this->ptr, this->count * sizeof(T));
-        std::free(this->ptr);
+        if(this->owns_memory)
+        {
+            rma_detail::advise_dontneed(this->ptr, this->count * sizeof(T));
+            std::free(this->ptr);
+        }
         this->win = MPI_WIN_NULL;
         this->ptr = nullptr;
         this->count = 0;
@@ -240,6 +259,28 @@ private:
     T *ptr;
     MPI_Win win;
     bool freed;
+    bool owns_memory;
+
+    void CreateWindowOver(size_t count, MPI_Info info)
+    {
+        bool using_default_info = (info == MPI_INFO_NULL);
+        if(using_default_info)
+        {
+            info = detail::CreateDefaultRMAInfo();
+        }
+
+        int err = MPI_Win_create(this->ptr, static_cast<MPI_Aint>(count * sizeof(T)), 1, info, this->comm, &this->win);
+        detail::CheckMPIError(err, "MPIRemoteMemoryAgent MPI_Win_create (user buffer)");
+
+        if(using_default_info)
+        {
+            MPI_Info_free(&info);
+        }
+
+        detail::ValidateUnifiedModel(this->win);
+        MPI_Win_set_errhandler(this->win, MPI_ERRORS_RETURN);
+        MPI_Win_lock_all(MPI_MODE_NOCHECK, this->win);
+    }
 
     void AllocateWindow(size_t count, MPI_Info info)
     {

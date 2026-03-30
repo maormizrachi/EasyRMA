@@ -24,10 +24,22 @@ public:
           buffer(nullptr), mr(nullptr),
           scratch(nullptr), scratch_mr(nullptr),
           staging(nullptr), staging_mr(nullptr), staging_size(0),
-          freed(false)
+          freed(false), owns_memory(true)
     {
         this->BuildRankMap();
         this->AllocateAndRegister(count);
+        this->ExchangeRemoteInfo();
+    }
+
+    IBVRemoteMemoryAgent(T *user_buffer, size_t count, IBVContext &context, MPI_Comm agent_comm)
+        : count(count), context(context), agent_comm(agent_comm),
+          buffer(user_buffer), mr(nullptr),
+          scratch(nullptr), scratch_mr(nullptr),
+          staging(nullptr), staging_mr(nullptr), staging_size(0),
+          freed(false), owns_memory(false)
+    {
+        this->BuildRankMap();
+        this->RegisterUserBuffer(count);
         this->ExchangeRemoteInfo();
     }
 
@@ -271,6 +283,10 @@ public:
 
     void Resize(size_t new_count) override
     {
+        if(not this->owns_memory)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::Resize: cannot resize user-supplied memory");
+        }
         this->context.DrainCompletions();
 
         T *old_buffer = this->buffer;
@@ -328,6 +344,10 @@ public:
 
     void Replace(size_t new_count) override
     {
+        if(not this->owns_memory)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::Replace: cannot replace user-supplied memory");
+        }
         this->context.DrainCompletions();
 
         if(this->staging_mr)
@@ -414,8 +434,11 @@ public:
         }
         if(this->buffer)
         {
-            rma_detail::advise_dontneed(this->buffer, this->count * sizeof(T));
-            std::free(this->buffer);
+            if(this->owns_memory)
+            {
+                rma_detail::advise_dontneed(this->buffer, this->count * sizeof(T));
+                std::free(this->buffer);
+            }
             this->buffer = nullptr;
         }
 
@@ -444,6 +467,7 @@ private:
     mutable size_t staging_size;
     std::vector<IBVRemoteRegion> remote_regions;
     bool freed;
+    bool owns_memory;
 
     static constexpr size_t DIRECT_REG_BYTE_THRESHOLD = 8192;
 
@@ -506,6 +530,30 @@ private:
             throw std::runtime_error("IBVRemoteMemoryAgent: ibv_reg_mr failed for staging");
         }
         this->staging_size = new_size;
+    }
+
+    void RegisterUserBuffer(size_t count)
+    {
+        size_t reg_size = count * sizeof(T);
+        if(reg_size == 0) reg_size = sizeof(T);
+
+        this->mr = ibv_reg_mr(this->context.GetPD(), this->buffer, reg_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        if(not this->mr)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent: ibv_reg_mr failed for user buffer");
+        }
+
+        this->scratch = static_cast<uint64_t*>(std::aligned_alloc(64, 64));
+        if(not this->scratch)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent: aligned_alloc failed for scratch");
+        }
+
+        this->scratch_mr = ibv_reg_mr(this->context.GetPD(), this->scratch, 64, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        if(not this->scratch_mr)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent: ibv_reg_mr failed for scratch");
+        }
     }
 
     void AllocateAndRegister(size_t count)
