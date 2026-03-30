@@ -3,6 +3,27 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <sys/mman.h>
+
+namespace rma_detail {
+    inline void advise_dontneed(void *ptr, size_t bytes)
+    {
+        if(not ptr or bytes == 0) return;
+
+        constexpr size_t page_size = 4096;
+        uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+        uintptr_t end   = start + bytes;
+
+        uintptr_t page_start = (start + page_size - 1) & ~(page_size - 1);
+        uintptr_t page_end   = end & ~(page_size - 1);
+
+        if(page_start < page_end)
+        {
+            madvise(reinterpret_cast<void*>(page_start),
+                    page_end - page_start, MADV_DONTNEED);
+        }
+    }
+} // namespace rma_detail
 
 template<typename T>
 class RemoteMemoryAgent

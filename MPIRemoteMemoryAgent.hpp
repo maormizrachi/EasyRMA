@@ -6,6 +6,7 @@
 #include "RemoteMemoryAgent.hpp"
 #include <mpi.h>
 #include <cstring>
+#include <cstdlib>
 #include <cassert>
 #include <algorithm>
 #include <stdexcept>
@@ -141,23 +142,15 @@ public:
 
     void Resize(size_t new_count) override
     {
-        MPI_Win new_win = MPI_WIN_NULL;
-        T *new_ptr = nullptr;
+        size_t new_alloc = new_count * sizeof(T);
+        if(new_alloc == 0) new_alloc = sizeof(T);
+        size_t new_aligned = ((new_alloc + 63) / 64) * 64;
 
-        MPI_Info info = detail::CreateDefaultRMAInfo();
-
-        int err = MPI_Win_allocate(static_cast<MPI_Aint>(new_count * sizeof(T)), 1, info, this->comm, &new_ptr, &new_win);
-        detail::CheckMPIError(err, "MPIRemoteMemoryAgent::Resize MPI_Win_allocate");
-        MPI_Info_free(&info);
-
+        T *new_ptr = static_cast<T*>(std::aligned_alloc(64, new_aligned));
         if(new_ptr == nullptr and new_count > 0)
         {
-            throw std::runtime_error("MPIRemoteMemoryAgent::Resize: MPI_Win_allocate returned null");
+            throw std::runtime_error("MPIRemoteMemoryAgent::Resize: aligned_alloc failed");
         }
-
-        detail::ValidateUnifiedModel(new_win);
-        MPI_Win_set_errhandler(new_win, MPI_ERRORS_RETURN);
-        MPI_Win_lock_all(MPI_MODE_NOCHECK, new_win);
 
         size_t copy_count = std::min(this->count, new_count);
         if(copy_count > 0)
@@ -165,8 +158,20 @@ public:
             std::memcpy(new_ptr, this->ptr, copy_count * sizeof(T));
         }
 
+        MPI_Info info = detail::CreateDefaultRMAInfo();
+        MPI_Win new_win = MPI_WIN_NULL;
+        int err = MPI_Win_create(new_ptr, static_cast<MPI_Aint>(new_count * sizeof(T)), 1, info, this->comm, &new_win);
+        detail::CheckMPIError(err, "MPIRemoteMemoryAgent::Resize MPI_Win_create");
+        MPI_Info_free(&info);
+
+        detail::ValidateUnifiedModel(new_win);
+        MPI_Win_set_errhandler(new_win, MPI_ERRORS_RETURN);
+        MPI_Win_lock_all(MPI_MODE_NOCHECK, new_win);
+
         MPI_Win_unlock_all(this->win);
         MPI_Win_free(&this->win);
+        rma_detail::advise_dontneed(this->ptr, this->count * sizeof(T));
+        std::free(this->ptr);
 
         this->win = new_win;
         this->ptr = new_ptr;
@@ -177,19 +182,26 @@ public:
     {
         MPI_Win_unlock_all(this->win);
         MPI_Win_free(&this->win);
+        rma_detail::advise_dontneed(this->ptr, this->count * sizeof(T));
+        std::free(this->ptr);
         this->win = MPI_WIN_NULL;
         this->ptr = nullptr;
         this->count = 0;
 
-        MPI_Info info = detail::CreateDefaultRMAInfo();
-        int err = MPI_Win_allocate(static_cast<MPI_Aint>(new_count * sizeof(T)), 1, info, this->comm, &this->ptr, &this->win);
-        detail::CheckMPIError(err, "MPIRemoteMemoryAgent::Replace MPI_Win_allocate");
-        MPI_Info_free(&info);
+        size_t new_alloc = new_count * sizeof(T);
+        if(new_alloc == 0) new_alloc = sizeof(T);
+        size_t new_aligned = ((new_alloc + 63) / 64) * 64;
 
+        this->ptr = static_cast<T*>(std::aligned_alloc(64, new_aligned));
         if(this->ptr == nullptr and new_count > 0)
         {
-            throw std::runtime_error("MPIRemoteMemoryAgent::Replace: MPI_Win_allocate returned null");
+            throw std::runtime_error("MPIRemoteMemoryAgent::Replace: aligned_alloc failed");
         }
+
+        MPI_Info info = detail::CreateDefaultRMAInfo();
+        int err = MPI_Win_create(this->ptr, static_cast<MPI_Aint>(new_count * sizeof(T)), 1, info, this->comm, &this->win);
+        detail::CheckMPIError(err, "MPIRemoteMemoryAgent::Replace MPI_Win_create");
+        MPI_Info_free(&info);
 
         detail::ValidateUnifiedModel(this->win);
         MPI_Win_set_errhandler(this->win, MPI_ERRORS_RETURN);
@@ -206,6 +218,8 @@ public:
         }
         MPI_Win_unlock_all(this->win);
         MPI_Win_free(&this->win);
+        rma_detail::advise_dontneed(this->ptr, this->count * sizeof(T));
+        std::free(this->ptr);
         this->win = MPI_WIN_NULL;
         this->ptr = nullptr;
         this->count = 0;
@@ -229,23 +243,28 @@ private:
 
     void AllocateWindow(size_t count, MPI_Info info)
     {
+        size_t alloc_size = count * sizeof(T);
+        if(alloc_size == 0) alloc_size = sizeof(T);
+        size_t aligned_size = ((alloc_size + 63) / 64) * 64;
+
+        this->ptr = static_cast<T*>(std::aligned_alloc(64, aligned_size));
+        if(this->ptr == nullptr and count > 0)
+        {
+            throw std::runtime_error("MPIRemoteMemoryAgent: aligned_alloc failed");
+        }
+
         bool using_default_info = (info == MPI_INFO_NULL);
         if(using_default_info)
         {
             info = detail::CreateDefaultRMAInfo();
         }
 
-        int err = MPI_Win_allocate(static_cast<MPI_Aint>(count * sizeof(T)), 1, info, this->comm, &this->ptr, &this->win);
-        detail::CheckMPIError(err, "MPIRemoteMemoryAgent constructor MPI_Win_allocate");
+        int err = MPI_Win_create(this->ptr, static_cast<MPI_Aint>(count * sizeof(T)), 1, info, this->comm, &this->win);
+        detail::CheckMPIError(err, "MPIRemoteMemoryAgent constructor MPI_Win_create");
 
         if(using_default_info)
         {
             MPI_Info_free(&info);
-        }
-
-        if(this->ptr == nullptr and count > 0)
-        {
-            throw std::runtime_error("MPIRemoteMemoryAgent: MPI_Win_allocate returned null pointer");
         }
 
         detail::ValidateUnifiedModel(this->win);

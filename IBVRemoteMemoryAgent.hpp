@@ -303,6 +303,7 @@ public:
         {
             ibv_dereg_mr(this->mr);
         }
+        rma_detail::advise_dontneed(old_buffer, old_count * sizeof(T));
         std::free(old_buffer);
 
         if(this->staging_mr)
@@ -312,6 +313,7 @@ public:
         }
         if(this->staging)
         {
+            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
             std::free(this->staging);
             this->staging = nullptr;
         }
@@ -335,6 +337,7 @@ public:
         }
         if(this->staging)
         {
+            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
             std::free(this->staging);
             this->staging = nullptr;
         }
@@ -347,6 +350,7 @@ public:
         }
         if(this->buffer)
         {
+            rma_detail::advise_dontneed(this->buffer, this->count * sizeof(T));
             std::free(this->buffer);
             this->buffer = nullptr;
         }
@@ -388,6 +392,7 @@ public:
         }
         if(this->staging)
         {
+            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
             std::free(this->staging);
             this->staging = nullptr;
         }
@@ -398,6 +403,7 @@ public:
         }
         if(this->scratch)
         {
+            rma_detail::advise_dontneed(this->scratch, sizeof(T));
             std::free(this->scratch);
             this->scratch = nullptr;
         }
@@ -408,6 +414,7 @@ public:
         }
         if(this->buffer)
         {
+            rma_detail::advise_dontneed(this->buffer, this->count * sizeof(T));
             std::free(this->buffer);
             this->buffer = nullptr;
         }
