@@ -27,6 +27,7 @@ public:
           freed(false), owns_memory(true)
     {
         this->BuildRankMap();
+        this->context.EnsureConnected(this->rank_map, this->agent_comm);
         this->AllocateAndRegister(count);
         this->ExchangeRemoteInfo();
     }
@@ -39,6 +40,7 @@ public:
           freed(false), owns_memory(false)
     {
         this->BuildRankMap();
+        this->context.EnsureConnected(this->rank_map, this->agent_comm);
         this->RegisterUserBuffer(count);
         this->ExchangeRemoteInfo();
     }

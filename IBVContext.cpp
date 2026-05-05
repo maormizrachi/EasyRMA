@@ -59,10 +59,9 @@ IBVContext::IBVContext(MPI_Comm comm, const std::string &device_name, uint8_t ib
         ThrowIBVError("ibv_create_cq failed", errno);
     }
 
-    this->CreateQPs();
-    this->ExchangeAndConnectQPs();
-
-    MPI_Barrier(this->comm);
+    this->qps.assign(this->size, nullptr);
+    this->qp_connected.assign(this->size, false);
+    this->outstanding_per_target.assign(this->size, 0);
 }
 
 IBVContext::~IBVContext()
@@ -116,39 +115,115 @@ ibv_context *IBVContext::OpenDevice(const std::string &device_name)
     return ctx;
 }
 
-void IBVContext::CreateQPs()
+ibv_qp *IBVContext::CreateSingleQP()
 {
-    this->qps.resize(this->size, nullptr);
-    this->outstanding_per_target.assign(this->size, 0);
-    this->qpn_to_rank.clear();
+    ibv_qp_init_attr init_attr{};
+    init_attr.send_cq = this->cq;
+    init_attr.recv_cq = this->cq;
+    init_attr.qp_type = IBV_QPT_RC;
+    init_attr.cap.max_send_wr = DEFAULT_MAX_SEND_WR;
+    init_attr.cap.max_recv_wr = 1;
+    init_attr.cap.max_send_sge = DEFAULT_MAX_SGE;
+    init_attr.cap.max_recv_sge = 1;
+    init_attr.cap.max_inline_data = 256;
+    init_attr.sq_sig_all = 0;
 
-    for(int i = 0; i < this->size; i++)
+    ibv_qp *qp = ibv_create_qp(this->pd, &init_attr);
+    if(not qp)
     {
-        ibv_qp_init_attr init_attr{};
-        init_attr.send_cq = this->cq;
-        init_attr.recv_cq = this->cq;
-        init_attr.qp_type = IBV_QPT_RC;
-        init_attr.cap.max_send_wr = DEFAULT_MAX_SEND_WR;
-        init_attr.cap.max_recv_wr = 1;
-        init_attr.cap.max_send_sge = DEFAULT_MAX_SGE;
-        init_attr.cap.max_recv_sge = 1;
-        init_attr.cap.max_inline_data = 256;
-        init_attr.sq_sig_all = 0;
+        ThrowIBVError("ibv_create_qp failed", errno);
+    }
 
-        ibv_qp *qp = ibv_create_qp(this->pd, &init_attr);
-        if(not qp)
+    if(this->max_inline_data == 0)
+    {
+        this->max_inline_data = init_attr.cap.max_inline_data;
+    }
+
+    return qp;
+}
+
+void IBVContext::EnsureConnected(const std::vector<int> &peer_world_ranks, MPI_Comm exchange_comm)
+{
+    int exchange_size;
+    MPI_Comm_size(exchange_comm, &exchange_size);
+    assert(static_cast<int>(peer_world_ranks.size()) == exchange_size);
+
+    bool any_new = false;
+    for(int i = 0; i < exchange_size; i++)
+    {
+        int wr = peer_world_ranks[i];
+        if(wr < 0 or wr >= this->size)
         {
-            ThrowIBVError("ibv_create_qp failed for peer " + std::to_string(i), errno);
+            ThrowIBVError("EnsureConnected: peer world rank out of bounds");
+        }
+        if(this->qps[wr] == nullptr or not this->qp_connected[wr])
+        {
+            any_new = true;
+            break;
+        }
+    }
+
+    int global_need = 0;
+    int local_need = any_new ? 1 : 0;
+    MPI_Allreduce(&local_need, &global_need, 1, MPI_INT, MPI_MAX, exchange_comm);
+    if(global_need == 0)
+        return;
+
+    std::vector<IBVConnectionInfo> send_buf(exchange_size, IBVConnectionInfo{});
+    std::vector<IBVConnectionInfo> recv_buf(exchange_size);
+
+    for(int i = 0; i < exchange_size; i++)
+    {
+        int wr = peer_world_ranks[i];
+        if(wr < 0 or wr >= this->size)
+        {
+            ThrowIBVError("EnsureConnected: peer world rank out of bounds");
+        }
+        if(this->qps[wr] == nullptr)
+        {
+            ibv_qp *qp = this->CreateSingleQP();
+            this->TransitionToInit(qp);
+            this->qps[wr] = qp;
+            this->qpn_to_rank[qp->qp_num] = wr;
         }
 
-        if(i == 0)
+        send_buf[i].lid = this->lid;
+        send_buf[i].gid = this->gid;
+        send_buf[i].psn = 0;
+        send_buf[i].qpn = this->qps[wr]->qp_num;
+    }
+
+    MPI_Alltoall(send_buf.data(), static_cast<int>(sizeof(IBVConnectionInfo)), MPI_BYTE,
+                 recv_buf.data(), static_cast<int>(sizeof(IBVConnectionInfo)), MPI_BYTE,
+                 exchange_comm);
+
+    for(int i = 0; i < exchange_size; i++)
+    {
+        int wr = peer_world_ranks[i];
+        if(this->qp_connected[wr])
         {
-            this->max_inline_data = init_attr.cap.max_inline_data;
+            continue;
+        }
+        if(recv_buf[i].qpn == 0)
+        {
+            ThrowIBVError("EnsureConnected: missing remote QP info");
         }
 
-        this->TransitionToInit(qp);
-        this->qps[i] = qp;
-        this->qpn_to_rank[qp->qp_num] = i;
+        if(wr == this->rank)
+        {
+            IBVConnectionInfo self_info{};
+            self_info.lid = this->lid;
+            self_info.gid = this->gid;
+            self_info.psn = 0;
+            self_info.qpn = this->qps[wr]->qp_num;
+            this->TransitionToRTR(this->qps[wr], self_info, 0);
+        }
+        else
+        {
+            this->TransitionToRTR(this->qps[wr], recv_buf[i], 0);
+        }
+        this->TransitionToRTS(this->qps[wr], 0);
+        this->qp_connected[wr] = true;
     }
 }
 
@@ -219,42 +294,6 @@ void IBVContext::TransitionToRTS(ibv_qp *qp, uint32_t local_psn)
     if(ibv_modify_qp(qp, &attr, flags) != 0)
     {
         ThrowIBVError("transition to RTS failed", errno);
-    }
-}
-
-void IBVContext::ExchangeAndConnectQPs()
-{
-    std::vector<IBVConnectionInfo> send_buf(this->size);
-    std::vector<IBVConnectionInfo> recv_buf(this->size);
-
-    for(int i = 0; i < this->size; i++)
-    {
-        IBVConnectionInfo &info = send_buf[i];
-        info.lid = this->lid;
-        info.gid = this->gid;
-        info.psn = 0;
-        info.qpn = this->qps[i]->qp_num;
-    }
-
-    MPI_Alltoall(send_buf.data(), static_cast<int>(sizeof(IBVConnectionInfo)), MPI_BYTE, recv_buf.data(), static_cast<int>(sizeof(IBVConnectionInfo)), MPI_BYTE, this->comm);
-
-    for(int i = 0; i < this->size; i++)
-    {
-        if(i == this->rank)
-        {
-            // Loopback QP: connect to self
-            IBVConnectionInfo self_info{};
-            self_info.lid = this->lid;
-            self_info.gid = this->gid;
-            self_info.psn = 0;
-            self_info.qpn = this->qps[i]->qp_num;
-            this->TransitionToRTR(this->qps[i], self_info, 0);
-            this->TransitionToRTS(this->qps[i], 0);
-            continue;
-        }
-
-        this->TransitionToRTR(this->qps[i], recv_buf[i], 0);
-        this->TransitionToRTS(this->qps[i], 0);
     }
 }
 
@@ -525,6 +564,7 @@ void IBVContext::Free()
         }
     }
     this->qps.clear();
+    this->qp_connected.clear();
 
     if(this->cq)
     {

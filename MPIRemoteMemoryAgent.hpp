@@ -146,6 +146,12 @@ public:
         MPI_Win_flush(target_rank, this->win);
     }
 
+    void SyncLocal() override
+    {
+        MPI_Win_sync(this->win);
+        RemoteMemoryAgent<T>::SyncLocal();
+    }
+
     void Resize(size_t new_count) override
     {
         if(not this->owns_memory)

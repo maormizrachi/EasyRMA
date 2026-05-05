@@ -65,6 +65,8 @@ public:
     void DrainCompletions();
     void DrainCompletionsForTarget(int target_rank);
 
+    void EnsureConnected(const std::vector<int> &peer_world_ranks, MPI_Comm exchange_comm);
+
     void Free();
 
 private:
@@ -79,6 +81,7 @@ private:
     ibv_gid gid;
     bool is_roce;
     std::vector<ibv_qp*> qps;
+    std::vector<bool> qp_connected;
     std::unordered_map<uint32_t, int> qpn_to_rank;
     std::vector<int> outstanding_per_target;
     int outstanding;
@@ -87,8 +90,7 @@ private:
     bool freed;
 
     ibv_context *OpenDevice(const std::string &device_name);
-    void CreateQPs();
-    void ExchangeAndConnectQPs();
+    ibv_qp *CreateSingleQP();
     void TransitionToInit(ibv_qp *qp);
     void TransitionToRTR(ibv_qp *qp, const IBVConnectionInfo &remote, uint32_t local_psn);
     void TransitionToRTS(ibv_qp *qp, uint32_t local_psn);

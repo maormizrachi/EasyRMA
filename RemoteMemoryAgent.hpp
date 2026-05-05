@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <sys/mman.h>
 
 namespace rma_detail {
@@ -57,6 +58,11 @@ public:
     virtual T FetchAndAdd(const T &addend, int target_rank, size_t target_disp, bool flush = true) = 0;
 
     virtual void Flush(int target_rank) = 0;
+
+    virtual void SyncLocal()
+    {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
 
     virtual void Resize(size_t new_count) = 0;
 
