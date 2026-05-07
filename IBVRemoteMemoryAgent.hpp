@@ -24,6 +24,7 @@ public:
           buffer(nullptr), mr(nullptr),
           scratch(nullptr), scratch_mr(nullptr),
           staging(nullptr), staging_mr(nullptr), staging_size(0),
+          staging_next(0), staging_active_target(-1),
           freed(false), owns_memory(true)
     {
         this->BuildRankMap();
@@ -37,6 +38,7 @@ public:
           buffer(user_buffer), mr(nullptr),
           scratch(nullptr), scratch_mr(nullptr),
           staging(nullptr), staging_mr(nullptr), staging_size(0),
+          staging_next(0), staging_active_target(-1),
           freed(false), owns_memory(false)
     {
         this->BuildRankMap();
@@ -98,18 +100,20 @@ public:
             }
             else
             {
-                this->EnsureStaging(target_disp + count);
-                std::memcpy(this->staging + target_disp, origin, payload_bytes);
-                local_addr = this->staging + target_disp;
+                T *staged = this->AllocateStaging(count, world_target);
+                std::memcpy(staged, origin, payload_bytes);
+                local_addr = staged;
                 local_lkey = this->StagingLkey();
             }
         }
 
-        this->context.PostRDMAWrite(world_target, local_addr, payload_bytes, local_lkey, remote_addr, remote.rkey, true);
+        const bool signalWrite = flush or temp_mr;
+        this->context.PostRDMAWrite(world_target, local_addr, payload_bytes, local_lkey, remote_addr, remote.rkey, signalWrite);
 
         if(flush or temp_mr)
         {
             this->context.DrainCompletions();
+            this->ResetStaging();
         }
         if(temp_mr)
         {
@@ -157,9 +161,9 @@ public:
         }
         else
         {
-            this->EnsureStaging(count);
-            std::memcpy(this->staging, contiguous_source, payload_bytes);
-            local_source = this->staging;
+            T *staged = this->AllocateStaging(count, world_target);
+            std::memcpy(staged, contiguous_source, payload_bytes);
+            local_source = staged;
             local_lkey = this->StagingLkey();
         }
 
@@ -171,11 +175,13 @@ public:
             entries[i].remote_addr = remote.addr + target_disps[i] * sizeof(T);
         }
 
-        this->context.PostRDMAWriteBatch(world_target, entries.data(), count, local_lkey, remote.rkey);
+        const bool signalWrite = flush or temp_mr;
+        this->context.PostRDMAWriteBatch(world_target, entries.data(), count, local_lkey, remote.rkey, signalWrite);
 
         if(flush or temp_mr)
         {
             this->context.DrainCompletions();
+            this->ResetStaging();
         }
         if(temp_mr)
         {
@@ -201,8 +207,7 @@ public:
 
         if(external)
         {
-            this->EnsureStaging(target_disp + count);
-            local_addr = this->staging + target_disp;
+            local_addr = this->AllocateStaging(count, world_target);
             local_lkey = this->StagingLkey();
         }
 
@@ -213,8 +218,9 @@ public:
             this->context.DrainCompletions();
             if(external)
             {
-                std::memcpy(result, this->staging + target_disp, count * sizeof(T));
+                std::memcpy(result, local_addr, count * sizeof(T));
             }
+            this->ResetStaging();
         }
     }
 
@@ -280,7 +286,10 @@ public:
     void Flush(int target_rank) override
     {
         int world_target = this->rank_map[target_rank];
+        const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+        this->context.PostRDMARead(world_target, this->scratch, 1, this->ScratchLkey(), remote.addr, remote.rkey, true);
         this->context.DrainCompletions();
+        this->ResetStaging();
     }
 
     void Resize(size_t new_count) override
@@ -336,6 +345,8 @@ public:
             this->staging = nullptr;
         }
         this->staging_size = 0;
+        this->staging_next = 0;
+        this->staging_active_target = -1;
 
         this->buffer = new_buffer;
         this->mr = new_mr;
@@ -364,6 +375,8 @@ public:
             this->staging = nullptr;
         }
         this->staging_size = 0;
+        this->staging_next = 0;
+        this->staging_active_target = -1;
 
         if(this->mr)
         {
@@ -446,6 +459,8 @@ public:
 
         this->count = 0;
         this->staging_size = 0;
+        this->staging_next = 0;
+        this->staging_active_target = -1;
         this->freed = true;
     }
 
@@ -467,6 +482,8 @@ private:
     mutable T *staging;
     mutable ibv_mr *staging_mr;
     mutable size_t staging_size;
+    mutable size_t staging_next;
+    mutable int staging_active_target;
     std::vector<IBVRemoteRegion> remote_regions;
     bool freed;
     bool owns_memory;
@@ -477,6 +494,50 @@ private:
     uint32_t ScratchLkey() const {return this->scratch_mr->lkey;}
     uint32_t StagingLkey() const {return this->staging_mr->lkey;}
     uint32_t BufferRkey() const {return this->mr->rkey;}
+
+    void ResetStaging() const
+    {
+        this->staging_next = 0;
+        this->staging_active_target = -1;
+    }
+
+    T *AllocateStaging(size_t required_count, int world_target) const
+    {
+        if(required_count == 0)
+        {
+            required_count = 1;
+        }
+
+        if(this->staging_active_target == -1)
+        {
+            this->staging_active_target = world_target;
+        }
+        else if(this->staging_active_target != world_target)
+        {
+            this->staging_active_target = -2;
+        }
+
+        if(required_count > this->staging_size)
+        {
+            this->EnsureStaging(required_count);
+            this->staging_active_target = world_target;
+        }
+
+        if(this->staging_next + required_count > this->staging_size)
+        {
+            this->context.DrainCompletions();
+            this->ResetStaging();
+            this->staging_active_target = world_target;
+            if(required_count > this->staging_size)
+            {
+                this->EnsureStaging(required_count);
+            }
+        }
+
+        T *result = this->staging + this->staging_next;
+        this->staging_next += required_count;
+        return result;
+    }
 
     void BuildRankMap()
     {
@@ -515,8 +576,12 @@ private:
         }
 
         size_t new_size = std::max(required_count, this->count);
+        if(new_size == 0) new_size = 1;
+        if(this->staging_size > 0)
+        {
+            new_size = std::max(new_size, this->staging_size * 2);
+        }
         size_t alloc_bytes = new_size * sizeof(T);
-        if(alloc_bytes == 0) alloc_bytes = sizeof(T);
         size_t aligned_bytes = ((alloc_bytes + 63) / 64) * 64;
 
         this->staging = static_cast<T*>(std::aligned_alloc(64, aligned_bytes));
@@ -532,6 +597,7 @@ private:
             throw std::runtime_error("IBVRemoteMemoryAgent: ibv_reg_mr failed for staging");
         }
         this->staging_size = new_size;
+        this->staging_next = 0;
     }
 
     void RegisterUserBuffer(size_t count)

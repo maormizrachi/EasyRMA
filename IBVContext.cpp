@@ -351,7 +351,7 @@ void IBVContext::PostRDMAWrite(int target_rank, const void *local_addr, size_t b
     this->PostSend(this->qps[target_rank], wr);
 }
 
-void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entries, size_t count, uint32_t lkey, uint32_t rkey)
+void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entries, size_t count, uint32_t lkey, uint32_t rkey, bool signaled)
 {
     static std::vector<ibv_sge> sges;
     static std::vector<ibv_send_wr> wrs;
@@ -403,7 +403,11 @@ void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entri
             wrs[i].next = (i + 1 < batch_size) ? &wrs[i + 1] : nullptr;
         }
 
-        wrs[batch_size - 1].send_flags |= IBV_SEND_SIGNALED;
+        const bool signal_batch = signaled or (pos + batch_size < count);
+        if(signal_batch)
+        {
+            wrs[batch_size - 1].send_flags |= IBV_SEND_SIGNALED;
+        }
 
         ibv_send_wr *bad_wr = nullptr;
         if(ibv_post_send(qp, &wrs[0], &bad_wr) != 0)
@@ -411,8 +415,11 @@ void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entri
             ThrowIBVError("PostRDMAWriteBatch: ibv_post_send failed", errno);
         }
 
-        this->outstanding++;
-        this->outstanding_per_target[target_for_tracking]++;
+        if(signal_batch)
+        {
+            this->outstanding++;
+            this->outstanding_per_target[target_for_tracking]++;
+        }
 
         pos += batch_size;
     }

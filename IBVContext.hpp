@@ -53,7 +53,7 @@ public:
         uint64_t remote_addr;
     };
 
-    void PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entries, size_t count, uint32_t lkey, uint32_t rkey);
+    void PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entries, size_t count, uint32_t lkey, uint32_t rkey, bool signaled = true);
 
     void PostRDMARead(int target_rank, void *local_addr, size_t bytes, uint32_t lkey, uint64_t remote_addr, uint32_t rkey, bool signaled = true);
 
