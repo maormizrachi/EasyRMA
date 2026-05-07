@@ -240,9 +240,9 @@ public:
         }
         else
         {
-            this->EnsureStaging(total_elements);
-            std::memcpy(this->staging, source, payload_bytes);
-            local_source = this->staging;
+            T *staged = this->AllocateStaging(total_elements, world_target);
+            std::memcpy(staged, source, payload_bytes);
+            local_source = staged;
             local_lkey = this->StagingLkey();
         }
 
@@ -254,11 +254,13 @@ public:
             rdma_entries[i].remote_addr = remote.addr + entries[i].target_disp * sizeof(T);
         }
 
-        this->context.PostRDMAWriteBatch(world_target, rdma_entries.data(), num_entries, local_lkey, remote.rkey);
+        const bool signalWrite = flush or temp_mr;
+        this->context.PostRDMAWriteBatch(world_target, rdma_entries.data(), num_entries, local_lkey, remote.rkey, signalWrite);
 
         if(flush or temp_mr)
         {
             this->context.DrainCompletions();
+            this->ResetStaging();
         }
         if(temp_mr)
         {
