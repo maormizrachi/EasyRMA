@@ -189,6 +189,83 @@ public:
         }
     }
 
+    void PutBatch(const T *source, size_t total_elements,
+                  const typename RemoteMemoryAgent<T>::PutBatchEntry *entries, size_t num_entries,
+                  int target_rank, bool flush = true) override
+    {
+        static std::vector<IBVContext::RDMAWriteEntry> rdma_entries;
+
+        if(num_entries == 0) return;
+
+        if(target_rank == this->my_agent_rank)
+        {
+            for(size_t i = 0; i < num_entries; i++)
+            {
+                std::memcpy(this->buffer + entries[i].target_disp,
+                            source + entries[i].source_offset,
+                            entries[i].count * sizeof(T));
+            }
+            return;
+        }
+
+        int world_target = this->rank_map[target_rank];
+        const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+
+        size_t payload_bytes = total_elements * sizeof(T);
+        const T *local_source;
+        uint32_t local_lkey;
+        ibv_mr *temp_mr = nullptr;
+
+        size_t max_entry_bytes = 0;
+        for(size_t i = 0; i < num_entries; i++)
+        {
+            size_t eb = entries[i].count * sizeof(T);
+            if(eb > max_entry_bytes) max_entry_bytes = eb;
+        }
+
+        if(max_entry_bytes <= this->context.GetMaxInlineData())
+        {
+            local_source = source;
+            local_lkey = 0;
+        }
+        else if(payload_bytes >= DIRECT_REG_BYTE_THRESHOLD)
+        {
+            temp_mr = ibv_reg_mr(this->context.GetPD(), const_cast<T*>(source), payload_bytes, IBV_ACCESS_LOCAL_WRITE);
+            if(not temp_mr)
+            {
+                throw std::runtime_error("IBVRemoteMemoryAgent::PutBatch: ibv_reg_mr failed for direct source");
+            }
+            local_source = source;
+            local_lkey = temp_mr->lkey;
+        }
+        else
+        {
+            this->EnsureStaging(total_elements);
+            std::memcpy(this->staging, source, payload_bytes);
+            local_source = this->staging;
+            local_lkey = this->StagingLkey();
+        }
+
+        rdma_entries.resize(num_entries);
+        for(size_t i = 0; i < num_entries; i++)
+        {
+            rdma_entries[i].local_addr = local_source + entries[i].source_offset;
+            rdma_entries[i].bytes = static_cast<uint32_t>(entries[i].count * sizeof(T));
+            rdma_entries[i].remote_addr = remote.addr + entries[i].target_disp * sizeof(T);
+        }
+
+        this->context.PostRDMAWriteBatch(world_target, rdma_entries.data(), num_entries, local_lkey, remote.rkey);
+
+        if(flush or temp_mr)
+        {
+            this->context.DrainCompletions();
+        }
+        if(temp_mr)
+        {
+            ibv_dereg_mr(temp_mr);
+        }
+    }
+
     void Get(T *result, size_t count, int target_rank, size_t target_disp, bool flush = true) const override
     {
         if(target_rank == this->my_agent_rank)

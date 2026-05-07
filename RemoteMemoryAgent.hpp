@@ -51,6 +51,29 @@ public:
         }
     }
 
+    struct PutBatchEntry
+    {
+        size_t source_offset;
+        size_t target_disp;
+        size_t count;
+    };
+
+    virtual void PutBatch(const T *source, size_t /*total_elements*/,
+                          const PutBatchEntry *entries, size_t num_entries,
+                          int target_rank, bool flush = true)
+    {
+        for(size_t i = 0; i < num_entries; i++)
+        {
+            this->Put(source + entries[i].source_offset,
+                      entries[i].count, target_rank,
+                      entries[i].target_disp, false);
+        }
+        if(flush)
+        {
+            this->Flush(target_rank);
+        }
+    }
+
     virtual void Get(T *result, size_t count, int target_rank, size_t target_disp, bool flush = true) const = 0;
 
     virtual void CompareAndSwap(const T &desired, const T &expected, T &old_value, int target_rank, size_t target_disp, bool flush = true) = 0;
