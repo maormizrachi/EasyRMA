@@ -469,6 +469,99 @@ public:
         this->ExchangeRemoteInfo();
     }
 
+    bool SupportsLocalResize() const override
+    {
+        return true;
+    }
+
+    RemoteBufferInfo LocalResize(size_t new_count) override
+    {
+        if(not this->owns_memory)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: cannot resize user-supplied memory");
+        }
+        this->context.DrainCompletions();
+
+        T *old_buffer = this->buffer;
+        ibv_mr *old_mr = this->mr;
+        size_t old_count = this->count;
+
+        size_t new_alloc_size = new_count * sizeof(T);
+        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
+        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
+
+        T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
+        if(not new_buffer and new_count > 0)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: aligned_alloc failed");
+        }
+        std::memset(new_buffer, 0, new_aligned_size);
+
+        ibv_mr *new_mr = ibv_reg_mr(this->context.GetPD(), new_buffer, new_aligned_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        if(not new_mr)
+        {
+            std::free(new_buffer);
+            throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: ibv_reg_mr failed");
+        }
+
+        size_t copy_count = std::min(old_count, new_count);
+        if(copy_count > 0)
+        {
+            std::memcpy(new_buffer, old_buffer, copy_count * sizeof(T));
+        }
+
+        if(old_buffer or old_mr)
+        {
+            this->retired_buffers.push_back({old_buffer, old_mr, old_count});
+        }
+
+        if(this->staging_mr)
+        {
+            ibv_dereg_mr(this->staging_mr);
+            this->staging_mr = nullptr;
+        }
+        if(this->staging)
+        {
+            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
+            std::free(this->staging);
+            this->staging = nullptr;
+        }
+        this->staging_size = 0;
+        this->staging_next = 0;
+        this->staging_active_target = -1;
+
+        this->buffer = new_buffer;
+        this->mr = new_mr;
+        this->count = new_count;
+
+        if(this->my_agent_rank >= 0 and this->my_agent_rank < static_cast<int>(this->remote_regions.size()))
+        {
+            this->remote_regions[this->my_agent_rank].addr = reinterpret_cast<uint64_t>(this->buffer);
+            this->remote_regions[this->my_agent_rank].rkey = this->BufferRkey();
+        }
+
+        return this->GetLocalRemoteInfo();
+    }
+
+    RemoteBufferInfo GetLocalRemoteInfo() const override
+    {
+        RemoteBufferInfo info;
+        info.addr = reinterpret_cast<uint64_t>(this->buffer);
+        info.rkey = this->BufferRkey();
+        info.count = this->count;
+        return info;
+    }
+
+    void UpdateRemoteInfo(int peer_rank, const RemoteBufferInfo &info) override
+    {
+        if(peer_rank < 0 or peer_rank >= static_cast<int>(this->remote_regions.size()))
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::UpdateRemoteInfo: peer rank is out of range");
+        }
+        this->remote_regions[peer_rank].addr = info.addr;
+        this->remote_regions[peer_rank].rkey = info.rkey;
+    }
+
     void Replace(size_t new_count) override
     {
         if(not this->owns_memory)
@@ -571,6 +664,20 @@ public:
             this->buffer = nullptr;
         }
 
+        for(RetiredBuffer &retired : this->retired_buffers)
+        {
+            if(retired.mr)
+            {
+                ibv_dereg_mr(retired.mr);
+            }
+            if(retired.buffer)
+            {
+                rma_detail::advise_dontneed(retired.buffer, retired.count * sizeof(T));
+                std::free(retired.buffer);
+            }
+        }
+        this->retired_buffers.clear();
+
         this->count = 0;
         this->staging_size = 0;
         this->staging_next = 0;
@@ -599,6 +706,13 @@ private:
     mutable size_t staging_next;
     mutable int staging_active_target;
     std::vector<IBVRemoteRegion> remote_regions;
+    struct RetiredBuffer
+    {
+        T *buffer;
+        ibv_mr *mr;
+        size_t count;
+    };
+    std::vector<RetiredBuffer> retired_buffers;
     bool freed;
     bool owns_memory;
 

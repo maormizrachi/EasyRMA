@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <stdexcept>
 #include <sys/mman.h>
 
 namespace rma_detail {
@@ -25,6 +26,13 @@ namespace rma_detail {
         }
     }
 } // namespace rma_detail
+
+struct RemoteBufferInfo
+{
+    uint64_t addr = 0;
+    uint32_t rkey = 0;
+    size_t count = 0;
+};
 
 template<typename T>
 class RemoteMemoryAgent
@@ -106,6 +114,29 @@ public:
     }
 
     virtual void Resize(size_t new_count) = 0;
+
+    virtual bool SupportsLocalResize() const
+    {
+        return false;
+    }
+
+    virtual RemoteBufferInfo LocalResize(size_t new_count)
+    {
+        (void)new_count;
+        throw std::runtime_error("RemoteMemoryAgent::LocalResize is not supported by this RMA backend");
+    }
+
+    virtual RemoteBufferInfo GetLocalRemoteInfo() const
+    {
+        return {};
+    }
+
+    virtual void UpdateRemoteInfo(int peer_rank, const RemoteBufferInfo &info)
+    {
+        (void)peer_rank;
+        (void)info;
+        throw std::runtime_error("RemoteMemoryAgent::UpdateRemoteInfo is not supported by this RMA backend");
+    }
 
     // Free the current buffer and allocate a fresh one of size new_count.
     // Unlike Resize, this does NOT copy old data — use only when contents are not needed.
