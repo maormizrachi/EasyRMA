@@ -94,8 +94,9 @@ public:
         return this->count;
     }
 
-    void Put(const T *origin, size_t count, int target_rank, size_t target_disp, bool flush = true) override
+    void Put(const T *origin, size_t count, int target_rank, size_t target_disp, bool flush = true, uint32_t source_lkey = 0) override
     {
+        (void)source_lkey;
         size_t bytes = count * sizeof(T);
         size_t byte_offset = target_disp * sizeof(T);
         MPI_Put(origin, static_cast<int>(bytes), MPI_BYTE, target_rank, static_cast<MPI_Aint>(byte_offset), static_cast<int>(bytes), MPI_BYTE, this->win);

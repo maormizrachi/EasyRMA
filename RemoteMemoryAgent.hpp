@@ -36,7 +36,7 @@ public:
 
     virtual size_t GetCount() const = 0;
 
-    virtual void Put(const T *origin, size_t count, int target_rank, size_t target_disp, bool flush = true) = 0;
+    virtual void Put(const T *origin, size_t count, int target_rank, size_t target_disp, bool flush = true, uint32_t source_lkey = 0) = 0;
 
     virtual void PutScatter(const T *contiguous_source, const uint32_t *target_disps, size_t count, int target_rank, bool flush = true)
     {
@@ -60,8 +60,9 @@ public:
 
     virtual void PutBatch(const T *source, size_t /*total_elements*/,
                           const PutBatchEntry *entries, size_t num_entries,
-                          int target_rank, bool flush = true)
+                          int target_rank, bool flush = true, uint32_t source_lkey = 0)
     {
+        (void)source_lkey;
         for(size_t i = 0; i < num_entries; i++)
         {
             this->Put(source + entries[i].source_offset,
@@ -72,6 +73,23 @@ public:
         {
             this->Flush(target_rank);
         }
+    }
+
+    struct SourceRegistration
+    {
+        uint32_t lkey = 0;
+        uint64_t handle = 0;
+    };
+
+    virtual SourceRegistration RegisterExternalSource(const void *data, size_t bytes)
+    {
+        (void)data; (void)bytes;
+        return {};
+    }
+
+    virtual void DeregisterExternalSource(uint64_t handle)
+    {
+        (void)handle;
     }
 
     virtual void Get(T *result, size_t count, int target_rank, size_t target_disp, bool flush = true) const = 0;

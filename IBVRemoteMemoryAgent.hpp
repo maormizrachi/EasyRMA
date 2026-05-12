@@ -66,7 +66,7 @@ public:
     }
 
     void Put(const T *origin, size_t count, int target_rank,
-             size_t target_disp, bool flush = true) override
+             size_t target_disp, bool flush = true, uint32_t source_lkey = 0) override
     {
         if(target_rank == this->my_agent_rank)
         {
@@ -80,10 +80,18 @@ public:
 
         size_t payload_bytes = count * sizeof(T);
         const void *local_addr = origin;
-        uint32_t local_lkey = this->BufferLkey();
+        uint32_t local_lkey;
         ibv_mr *temp_mr = nullptr;
 
-        if(not this->IsInBuffer(origin, count))
+        if(source_lkey != 0)
+        {
+            local_lkey = source_lkey;
+        }
+        else if(this->IsInBuffer(origin, count))
+        {
+            local_lkey = this->BufferLkey();
+        }
+        else
         {
             if(payload_bytes <= this->context.GetMaxInlineData())
             {
@@ -191,7 +199,7 @@ public:
 
     void PutBatch(const T *source, size_t total_elements,
                   const typename RemoteMemoryAgent<T>::PutBatchEntry *entries, size_t num_entries,
-                  int target_rank, bool flush = true) override
+                  int target_rank, bool flush = true, uint32_t source_lkey = 0) override
     {
         static std::vector<IBVContext::RDMAWriteEntry> rdma_entries;
 
@@ -216,34 +224,42 @@ public:
         uint32_t local_lkey;
         ibv_mr *temp_mr = nullptr;
 
-        size_t max_entry_bytes = 0;
-        for(size_t i = 0; i < num_entries; i++)
-        {
-            size_t eb = entries[i].count * sizeof(T);
-            if(eb > max_entry_bytes) max_entry_bytes = eb;
-        }
-
-        if(max_entry_bytes <= this->context.GetMaxInlineData())
+        if(source_lkey != 0)
         {
             local_source = source;
-            local_lkey = 0;
-        }
-        else if(payload_bytes >= DIRECT_REG_BYTE_THRESHOLD)
-        {
-            temp_mr = ibv_reg_mr(this->context.GetPD(), const_cast<T*>(source), payload_bytes, IBV_ACCESS_LOCAL_WRITE);
-            if(not temp_mr)
-            {
-                throw std::runtime_error("IBVRemoteMemoryAgent::PutBatch: ibv_reg_mr failed for direct source");
-            }
-            local_source = source;
-            local_lkey = temp_mr->lkey;
+            local_lkey = source_lkey;
         }
         else
         {
-            T *staged = this->AllocateStaging(total_elements, world_target);
-            std::memcpy(staged, source, payload_bytes);
-            local_source = staged;
-            local_lkey = this->StagingLkey();
+            size_t max_entry_bytes = 0;
+            for(size_t i = 0; i < num_entries; i++)
+            {
+                size_t eb = entries[i].count * sizeof(T);
+                if(eb > max_entry_bytes) max_entry_bytes = eb;
+            }
+
+            if(max_entry_bytes <= this->context.GetMaxInlineData())
+            {
+                local_source = source;
+                local_lkey = 0;
+            }
+            else if(payload_bytes >= DIRECT_REG_BYTE_THRESHOLD)
+            {
+                temp_mr = ibv_reg_mr(this->context.GetPD(), const_cast<T*>(source), payload_bytes, IBV_ACCESS_LOCAL_WRITE);
+                if(not temp_mr)
+                {
+                    throw std::runtime_error("IBVRemoteMemoryAgent::PutBatch: ibv_reg_mr failed for direct source");
+                }
+                local_source = source;
+                local_lkey = temp_mr->lkey;
+            }
+            else
+            {
+                T *staged = this->AllocateStaging(total_elements, world_target);
+                std::memcpy(staged, source, payload_bytes);
+                local_source = staged;
+                local_lkey = this->StagingLkey();
+            }
         }
 
         rdma_entries.resize(num_entries);
@@ -265,6 +281,25 @@ public:
         if(temp_mr)
         {
             ibv_dereg_mr(temp_mr);
+        }
+    }
+
+    typename RemoteMemoryAgent<T>::SourceRegistration RegisterExternalSource(const void *data, size_t bytes) override
+    {
+        if(bytes == 0) return {};
+        ibv_mr *ext_mr = ibv_reg_mr(this->context.GetPD(), const_cast<void*>(data), bytes, IBV_ACCESS_LOCAL_WRITE);
+        if(not ext_mr)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::RegisterExternalSource: ibv_reg_mr failed");
+        }
+        return {ext_mr->lkey, reinterpret_cast<uint64_t>(ext_mr)};
+    }
+
+    void DeregisterExternalSource(uint64_t handle) override
+    {
+        if(handle)
+        {
+            ibv_dereg_mr(reinterpret_cast<ibv_mr*>(handle));
         }
     }
 

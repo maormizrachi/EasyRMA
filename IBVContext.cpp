@@ -372,7 +372,9 @@ void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entri
         target_for_tracking = it->second;
     }
 
-    size_t max_batch = static_cast<size_t>(std::max(1, std::min(this->cq_size / 2, DEFAULT_MAX_SEND_WR - 2)));
+    // Leave headroom in the SQ for WRs the caller may post after this batch
+    // (e.g. TransferParticles appends TH-index and lengths Puts).
+    size_t max_batch = static_cast<size_t>(std::max(1, std::min(this->cq_size / 2, DEFAULT_MAX_SEND_WR - 8)));
 
     size_t pos = 0;
     while(pos < count)
