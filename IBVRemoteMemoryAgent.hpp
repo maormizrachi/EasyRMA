@@ -1,6 +1,8 @@
 #ifndef IBV_REMOTE_MEMORY_AGENT_HPP
 #define IBV_REMOTE_MEMORY_AGENT_HPP
 
+#include <cassert>
+
 #ifdef __WITH_IBV
 
 #include "RemoteMemoryAgent.hpp"
@@ -9,7 +11,6 @@
 #include <mpi.h>
 #include <cstring>
 #include <cstdlib>
-#include <cassert>
 #include <algorithm>
 #include <vector>
 #include <stdexcept>
