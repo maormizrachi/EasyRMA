@@ -1,6 +1,8 @@
 #ifndef PROGRESS_COUNTER_HPP
 #define PROGRESS_COUNTER_HPP
 
+#ifdef __WITH_MPI
+
 #include "GlobalCounter.hpp"
 
 class ProgressCounter
@@ -32,5 +34,7 @@ private:
     MPI_Comm comm;
     bool destroyed;
 };
+
+#endif // __WITH_MPI
 
 #endif // PROGRESS_COUNTER_HPP

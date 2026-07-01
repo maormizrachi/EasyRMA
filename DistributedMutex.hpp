@@ -1,6 +1,8 @@
 #ifndef DISTRIBUTED_MUTEX_HPP
 #define DISTRIBUTED_MUTEX_HPP
 
+#ifdef __WITH_MPI
+
 #include <mpi.h>
 #include <memory>
 #include <mpi_utils/mpi_commands.hpp>
@@ -25,5 +27,7 @@ private:
     std::unique_ptr<RemoteMemoryAgent<int>> agent;
     bool destroyed;
 };
+
+#endif // __WITH_MPI
 
 #endif // DISTRIBUTED_MUTEX_HPP

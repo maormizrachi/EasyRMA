@@ -1,3 +1,5 @@
+#ifdef __WITH_MPI
+
 #include "ProgressCounter.hpp"
 
 ProgressCounter::ProgressCounter(const MPI_Comm &comm)
@@ -96,3 +98,5 @@ void ProgressCounter::MarkDone(void)
     MPI_Win_flush_all(this->is_done_win);
     MPI_Win_unlock_all(this->is_done_win);
 }
+
+#endif // __WITH_MPI

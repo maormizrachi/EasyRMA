@@ -1,3 +1,5 @@
+#ifdef __WITH_MPI
+
 #include "GlobalCounter.hpp"
 
 GlobalCounter::GlobalCounter(const MPI_Comm &comm, int globalInitialValue)
@@ -86,3 +88,5 @@ int GlobalCounter::Increment(int n)
     MPI_Win_unlock(this->master_rank, this->counter_win);
     return result;
 }
+
+#endif // __WITH_MPI

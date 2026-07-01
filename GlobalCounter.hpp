@@ -1,6 +1,8 @@
 #ifndef GLOBAL_COUNTER_HPP
 #define GLOBAL_COUNTER_HPP
 
+#ifdef __WITH_MPI
+
 #include <mpi_utils/mpi_commands.hpp>
 
 class GlobalCounter
@@ -27,5 +29,7 @@ private:
     MPI_Win counter_win;
     bool destroyed;
 };
+
+#endif // __WITH_MPI
 
 #endif // GLOBAL_COUNTER_HPP

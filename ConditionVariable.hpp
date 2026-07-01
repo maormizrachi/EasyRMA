@@ -1,6 +1,8 @@
 #ifndef CONDITION_VARIABLE_HPP
 #define CONDITION_VARIABLE_HPP
 
+#ifdef __WITH_MPI
+
 #include <stdexcept>
 #include "DistributedMutex.hpp"
 
@@ -25,5 +27,7 @@ private:
     int *value;
     bool destroyed;
 };
+
+#endif // __WITH_MPI
 
 #endif // CONDITION_VARIABLE_HPP

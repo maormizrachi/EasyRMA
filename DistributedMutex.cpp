@@ -1,3 +1,5 @@
+#ifdef __WITH_MPI
+
 #include "DistributedMutex.hpp"
 #include <cassert>
 
@@ -66,3 +68,5 @@ void DistributedMutex::Unlock(void)
     int old;
     this->agent->CompareAndSwap(zero, one, old, this->rank, 0);
 }
+
+#endif // __WITH_MPI

@@ -1,3 +1,5 @@
+#ifdef __WITH_MPI
+
 #include "ConditionVariable.hpp"
 
 ConditionVariable::ConditionVariable(const MPI_Comm &comm)
@@ -79,3 +81,5 @@ void ConditionVariable::Notify(void)
     MPI_Win_unlock(this->other_rank, this->win);
     MPI_Barrier(this->comm);
 }
+
+#endif // __WITH_MPI
