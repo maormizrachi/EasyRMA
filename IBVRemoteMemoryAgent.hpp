@@ -341,61 +341,70 @@ public:
 
     void CompareAndSwap(const T &desired, const T &expected, T &old_value, int target_rank, size_t target_disp, bool flush = true) override
     {
-        assert(sizeof(T) == 4 or sizeof(T) == 8);
-
-        // Always use RDMA CAS (including loopback for local target)
-        // to ensure atomicity with remote RDMA CAS from other ranks.
-        int world_target = this->rank_map[target_rank];
-        const IBVRemoteRegion &remote = this->remote_regions[target_rank];
-        uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
-
-        uint64_t compare_val = 0, swap_val = 0;
-        std::memcpy(&compare_val, &expected, sizeof(T));
-        std::memcpy(&swap_val, &desired, sizeof(T));
-
-        if(sizeof(T) == 4)
+        if constexpr(sizeof(T) <= 8)
         {
-            remote_addr = (remote_addr / 8) * 8;
+            int world_target = this->rank_map[target_rank];
+            const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+            uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
+
+            uint64_t compare_val = 0, swap_val = 0;
+            std::memcpy(&compare_val, &expected, sizeof(T));
+            std::memcpy(&swap_val, &desired, sizeof(T));
+
+            if constexpr(sizeof(T) == 4)
+            {
+                remote_addr = (remote_addr / 8) * 8;
+            }
+
+            this->context.PostAtomicCAS(world_target, this->scratch, this->ScratchLkey(), remote_addr, remote.rkey, compare_val, swap_val, true);
+
+            if(flush)
+            {
+                this->context.DrainCompletions();
+            }
+
+            std::memcpy(&old_value, this->scratch, sizeof(T));
         }
-
-        this->context.PostAtomicCAS(world_target, this->scratch, this->ScratchLkey(), remote_addr, remote.rkey, compare_val, swap_val, true);
-
-        if(flush)
+        else
         {
-            this->context.DrainCompletions();
+            (void)desired; (void)expected; (void)old_value;
+            (void)target_rank; (void)target_disp; (void)flush;
+            throw std::runtime_error("CompareAndSwap requires sizeof(T) <= 8");
         }
-
-        std::memcpy(&old_value, this->scratch, sizeof(T));
     }
 
     T FetchAndAdd(const T &addend, int target_rank, size_t target_disp, bool flush = true) override
     {
-        assert(sizeof(T) == 4 or sizeof(T) == 8);
-
-        // Always use RDMA FAA (including loopback for local target)
-        // to ensure atomicity with remote RDMA FAA from other ranks.
-        int world_target = this->rank_map[target_rank];
-        const IBVRemoteRegion &remote = this->remote_regions[target_rank];
-        uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
-
-        uint64_t add_val = 0;
-        std::memcpy(&add_val, &addend, sizeof(T));
-
-        if(sizeof(T) == 4)
+        if constexpr(sizeof(T) <= 8)
         {
-            remote_addr = (remote_addr / 8) * 8;
+            int world_target = this->rank_map[target_rank];
+            const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+            uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
+
+            uint64_t add_val = 0;
+            std::memcpy(&add_val, &addend, sizeof(T));
+
+            if constexpr(sizeof(T) == 4)
+            {
+                remote_addr = (remote_addr / 8) * 8;
+            }
+
+            this->context.PostAtomicFetchAdd(world_target, this->scratch, this->ScratchLkey(), remote_addr, remote.rkey, add_val, true);
+
+            if(flush)
+            {
+                this->context.DrainCompletions();
+            }
+
+            T old_value;
+            std::memcpy(&old_value, this->scratch, sizeof(T));
+            return old_value;
         }
-
-        this->context.PostAtomicFetchAdd(world_target, this->scratch, this->ScratchLkey(), remote_addr, remote.rkey, add_val, true);
-
-        if(flush)
+        else
         {
-            this->context.DrainCompletions();
+            (void)addend; (void)target_rank; (void)target_disp; (void)flush;
+            throw std::runtime_error("FetchAndAdd requires sizeof(T) <= 8");
         }
-
-        T old_value;
-        std::memcpy(&old_value, this->scratch, sizeof(T));
-        return old_value;
     }
 
     void Flush(int target_rank) override
