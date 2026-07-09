@@ -328,10 +328,38 @@ void IBVContext::EnsureCQSpace()
 
 void IBVContext::PostRDMAWrite(int target_rank, const void *local_addr, size_t bytes, uint32_t lkey, uint64_t remote_addr, uint32_t rkey, bool signaled)
 {
+    constexpr size_t MAX_RDMA_CHUNK = 1ULL << 30;
+
+    const uint8_t *src = static_cast<const uint8_t*>(local_addr);
+    while(bytes > MAX_RDMA_CHUNK)
+    {
+        this->EnsureCQSpace();
+
+        ibv_sge sge{};
+        sge.addr = reinterpret_cast<uint64_t>(src);
+        sge.length = static_cast<uint32_t>(MAX_RDMA_CHUNK);
+        sge.lkey = lkey;
+
+        ibv_send_wr wr{};
+        wr.wr_id = 0;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_RDMA_WRITE;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.wr.rdma.rkey = rkey;
+
+        this->PostSend(this->qps[target_rank], wr);
+
+        src += MAX_RDMA_CHUNK;
+        remote_addr += MAX_RDMA_CHUNK;
+        bytes -= MAX_RDMA_CHUNK;
+    }
+
     this->EnsureCQSpace();
 
     ibv_sge sge{};
-    sge.addr = reinterpret_cast<uint64_t>(local_addr);
+    sge.addr = reinterpret_cast<uint64_t>(src);
     sge.length = static_cast<uint32_t>(bytes);
     sge.lkey = lkey;
 
@@ -353,12 +381,57 @@ void IBVContext::PostRDMAWrite(int target_rank, const void *local_addr, size_t b
 
 void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entries, size_t count, uint32_t lkey, uint32_t rkey, bool signaled)
 {
+    static std::vector<RDMAWriteEntry> expanded;
     static std::vector<ibv_sge> sges;
     static std::vector<ibv_send_wr> wrs;
 
     if(count == 0)
     {
         return;
+    }
+
+    constexpr uint32_t MAX_RDMA_CHUNK = 1U << 30;
+
+    bool needExpand = false;
+    for(size_t i = 0; i < count; i++)
+    {
+        if(entries[i].bytes > MAX_RDMA_CHUNK)
+        {
+            needExpand = true;
+            break;
+        }
+    }
+
+    const RDMAWriteEntry *workEntries = entries;
+    size_t workCount = count;
+
+    if(needExpand)
+    {
+        expanded.clear();
+        for(size_t i = 0; i < count; i++)
+        {
+            const RDMAWriteEntry &e = entries[i];
+            if(e.bytes <= MAX_RDMA_CHUNK)
+            {
+                expanded.push_back(e);
+            }
+            else
+            {
+                const uint8_t *src = static_cast<const uint8_t*>(e.local_addr);
+                uint64_t raddr = e.remote_addr;
+                uint32_t left = e.bytes;
+                while(left > MAX_RDMA_CHUNK)
+                {
+                    expanded.push_back({src, MAX_RDMA_CHUNK, raddr});
+                    src += MAX_RDMA_CHUNK;
+                    raddr += MAX_RDMA_CHUNK;
+                    left -= MAX_RDMA_CHUNK;
+                }
+                expanded.push_back({src, left, raddr});
+            }
+        }
+        workEntries = expanded.data();
+        workCount = expanded.size();
     }
 
     ibv_qp *qp = this->qps[target_rank];
@@ -372,22 +445,20 @@ void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entri
         target_for_tracking = it->second;
     }
 
-    // Leave headroom in the SQ for WRs the caller may post after this batch
-    // (e.g. TransferParticles appends TH-index and lengths Puts).
     size_t max_batch = static_cast<size_t>(std::max(1, std::min(this->cq_size / 2, DEFAULT_MAX_SEND_WR - 8)));
 
     size_t pos = 0;
-    while(pos < count)
+    while(pos < workCount)
     {
         this->DrainCompletions();
 
-        size_t batch_size = std::min(count - pos, max_batch);
+        size_t batch_size = std::min(workCount - pos, max_batch);
         sges.resize(batch_size);
         wrs.resize(batch_size);
 
         for(size_t i = 0; i < batch_size; i++)
         {
-            const RDMAWriteEntry &e = entries[pos + i];
+            const RDMAWriteEntry &e = workEntries[pos + i];
 
             sges[i] = {};
             sges[i].addr = reinterpret_cast<uint64_t>(e.local_addr);
@@ -405,7 +476,7 @@ void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entri
             wrs[i].next = (i + 1 < batch_size) ? &wrs[i + 1] : nullptr;
         }
 
-        const bool signal_batch = signaled or (pos + batch_size < count);
+        const bool signal_batch = signaled or (pos + batch_size < workCount);
         if(signal_batch)
         {
             wrs[batch_size - 1].send_flags |= IBV_SEND_SIGNALED;
@@ -429,10 +500,38 @@ void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entri
 
 void IBVContext::PostRDMARead(int target_rank, void *local_addr, size_t bytes, uint32_t lkey, uint64_t remote_addr, uint32_t rkey, bool signaled)
 {
+    constexpr size_t MAX_RDMA_CHUNK = 1ULL << 30;
+
+    uint8_t *dst = static_cast<uint8_t*>(local_addr);
+    while(bytes > MAX_RDMA_CHUNK)
+    {
+        this->EnsureCQSpace();
+
+        ibv_sge sge{};
+        sge.addr = reinterpret_cast<uint64_t>(dst);
+        sge.length = static_cast<uint32_t>(MAX_RDMA_CHUNK);
+        sge.lkey = lkey;
+
+        ibv_send_wr wr{};
+        wr.wr_id = 0;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_RDMA_READ;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.wr.rdma.rkey = rkey;
+
+        this->PostSend(this->qps[target_rank], wr);
+
+        dst += MAX_RDMA_CHUNK;
+        remote_addr += MAX_RDMA_CHUNK;
+        bytes -= MAX_RDMA_CHUNK;
+    }
+
     this->EnsureCQSpace();
 
     ibv_sge sge{};
-    sge.addr = reinterpret_cast<uint64_t>(local_addr);
+    sge.addr = reinterpret_cast<uint64_t>(dst);
     sge.length = static_cast<uint32_t>(bytes);
     sge.lkey = lkey;
 

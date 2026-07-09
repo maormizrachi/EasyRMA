@@ -511,10 +511,29 @@ public:
             std::memcpy(new_buffer, old_buffer, copy_count * sizeof(T));
         }
 
-        if(old_buffer or old_mr)
+        if(old_mr)
         {
-            this->retired_buffers.push_back({old_buffer, old_mr, old_count});
+            ibv_dereg_mr(old_mr);
         }
+        if(old_buffer)
+        {
+            rma_detail::advise_dontneed(old_buffer, old_count * sizeof(T));
+            std::free(old_buffer);
+        }
+
+        for(RetiredBuffer &retired : this->retired_buffers)
+        {
+            if(retired.mr)
+            {
+                ibv_dereg_mr(retired.mr);
+            }
+            if(retired.buffer)
+            {
+                rma_detail::advise_dontneed(retired.buffer, retired.count * sizeof(T));
+                std::free(retired.buffer);
+            }
+        }
+        this->retired_buffers.clear();
 
         if(this->staging_mr)
         {

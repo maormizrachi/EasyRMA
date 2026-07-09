@@ -26,10 +26,10 @@ public:
 
     static RDMA_Type ResolveAutoRDMA()
     {
-#ifdef OPEN_MPI
-        return RDMA_Type::MPI_RMA;
-#elif defined(__WITH_IBV)
+#ifdef __WITH_IBV
         return RDMA_Type::IBV_RDMA;
+#elif defined(OPEN_MPI)
+        return RDMA_Type::MPI_RMA;
 #else
         return RDMA_Type::MPI_RMA;
 #endif
