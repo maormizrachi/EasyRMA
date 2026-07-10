@@ -103,7 +103,7 @@ public:
             if(payload_bytes >= DIRECT_REG_BYTE_THRESHOLD)
             {
                 temp_mr = this->context.RegisterMemory(const_cast<T*>(origin), payload_bytes,
-                    FI_READ | FI_WRITE);
+                    FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
                 if(not temp_mr)
                 {
                     throw std::runtime_error("OFIRemoteMemoryAgent::Put: fi_mr_reg failed for direct source");
@@ -159,7 +159,7 @@ public:
         if(payload_bytes >= DIRECT_REG_BYTE_THRESHOLD)
         {
             temp_mr = this->context.RegisterMemory(const_cast<T*>(contiguous_source), payload_bytes,
-                FI_READ | FI_WRITE);
+                FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
             if(not temp_mr)
             {
                 throw std::runtime_error("OFIRemoteMemoryAgent::PutScatter: fi_mr_reg failed for direct source");
@@ -233,7 +233,7 @@ public:
             if(payload_bytes >= DIRECT_REG_BYTE_THRESHOLD)
             {
                 temp_mr = this->context.RegisterMemory(const_cast<T*>(source), payload_bytes,
-                    FI_READ | FI_WRITE);
+                    FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
                 if(not temp_mr)
                 {
                     throw std::runtime_error("OFIRemoteMemoryAgent::PutBatch: fi_mr_reg failed for direct source");
@@ -272,7 +272,7 @@ public:
     {
         if(bytes == 0) return {};
         fid_mr *ext_mr = this->context.RegisterMemory(const_cast<void*>(data), bytes,
-            FI_READ | FI_WRITE);
+            FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
         if(not ext_mr)
         {
             throw std::runtime_error("OFIRemoteMemoryAgent::RegisterExternalSource: fi_mr_reg failed");
@@ -428,6 +428,32 @@ public:
         this->ResetStaging();
     }
 
+    void QuiesceTarget(int target_rank) override
+    {
+        if(target_rank == this->my_agent_rank)
+        {
+            return;
+        }
+        int world_target = this->rank_map[target_rank];
+        const OFIRemoteRegion &remote = this->remote_regions[target_rank];
+        // Fenced read: FI_FENCE orders this after all prior transmit operations,
+        // and the read's round-trip guarantees remote visibility of prior writes.
+        this->context.PostFencedRDMARead(world_target, this->scratch, 1,
+                                         this->ScratchDesc(), remote.addr, remote.key);
+        this->context.DrainCompletions();
+        this->ResetStaging();
+    }
+
+    bool SupportsAsyncReallocation() const override
+    {
+        return this->SupportsLocalResize();
+    }
+
+    void MakeProgress() override
+    {
+        this->context.MakeProgress();
+    }
+
     void Resize(size_t new_count) override
     {
         if(not this->owns_memory)
@@ -436,15 +462,36 @@ public:
         }
         this->context.DrainCompletions();
 
-        T *old_buffer = this->buffer;
         size_t old_count = this->count;
+        size_t copy_count = std::min(old_count, new_count);
+
+        std::vector<unsigned char> saved;
+        if(copy_count > 0)
+        {
+            saved.resize(copy_count * sizeof(T));
+            std::memcpy(saved.data(), this->buffer, saved.size());
+        }
+
+        this->ResetStaging();
+
+        if(this->mr)
+        {
+            this->context.DeregisterMemory(this->mr);
+            this->mr = nullptr;
+        }
+        if(this->buffer)
+        {
+            rma_detail::advise_dontneed(this->buffer, old_count * sizeof(T));
+            std::free(this->buffer);
+            this->buffer = nullptr;
+        }
 
         size_t new_alloc_size = new_count * sizeof(T);
         if(new_alloc_size == 0) new_alloc_size = sizeof(T);
         size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
 
         T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
-        if(not new_buffer and new_count > 0)
+        if(not new_buffer)
         {
             throw std::runtime_error("OFIRemoteMemoryAgent::Resize: aligned_alloc failed");
         }
@@ -454,23 +501,14 @@ public:
             FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
         if(not new_mr)
         {
+            std::free(new_buffer);
             throw std::runtime_error("OFIRemoteMemoryAgent::Resize: fi_mr_reg failed");
         }
 
-        size_t copy_count = std::min(old_count, new_count);
         if(copy_count > 0)
         {
-            std::memcpy(new_buffer, old_buffer, copy_count * sizeof(T));
+            std::memcpy(new_buffer, saved.data(), saved.size());
         }
-
-        if(this->mr)
-        {
-            this->context.DeregisterMemory(this->mr);
-        }
-        rma_detail::advise_dontneed(old_buffer, old_count * sizeof(T));
-        std::free(old_buffer);
-
-        this->FreeStaging();
 
         this->buffer = new_buffer;
         this->mr = new_mr;
@@ -492,44 +530,22 @@ public:
         }
         this->context.DrainCompletions();
 
-        T *old_buffer = this->buffer;
-        fid_mr *old_mr = this->mr;
         size_t old_count = this->count;
-
-        size_t new_alloc_size = new_count * sizeof(T);
-        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
-        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
-
-        T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
-        if(not new_buffer and new_count > 0)
-        {
-            throw std::runtime_error("OFIRemoteMemoryAgent::LocalResize: aligned_alloc failed");
-        }
-        std::memset(new_buffer, 0, new_aligned_size);
-
-        fid_mr *new_mr = this->context.RegisterMemory(new_buffer, new_aligned_size,
-            FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
-        if(not new_mr)
-        {
-            std::free(new_buffer);
-            throw std::runtime_error("OFIRemoteMemoryAgent::LocalResize: fi_mr_reg failed");
-        }
-
         size_t copy_count = std::min(old_count, new_count);
+
+        // Save active data locally before releasing all MR resources.
+        // This lets us deregister every MR slot before fi_mr_reg, avoiding
+        // CXI key exhaustion (ENOKEY).
+        std::vector<unsigned char> saved;
         if(copy_count > 0)
         {
-            std::memcpy(new_buffer, old_buffer, copy_count * sizeof(T));
+            saved.resize(copy_count * sizeof(T));
+            std::memcpy(saved.data(), this->buffer, saved.size());
         }
 
-        if(old_mr)
-        {
-            this->context.DeregisterMemory(old_mr);
-        }
-        if(old_buffer)
-        {
-            rma_detail::advise_dontneed(old_buffer, old_count * sizeof(T));
-            std::free(old_buffer);
-        }
+        // Reset staging pointer but keep the MR registered to avoid
+        // consuming a new provider key slot on the next use.
+        this->ResetStaging();
 
         for(RetiredBuffer &retired : this->retired_buffers)
         {
@@ -545,7 +561,42 @@ public:
         }
         this->retired_buffers.clear();
 
-        this->FreeStaging();
+        if(this->mr)
+        {
+            this->context.DeregisterMemory(this->mr);
+            this->mr = nullptr;
+        }
+        if(this->buffer)
+        {
+            rma_detail::advise_dontneed(this->buffer, old_count * sizeof(T));
+            std::free(this->buffer);
+            this->buffer = nullptr;
+        }
+
+        // Allocate and register new buffer with freed MR slots
+        size_t new_alloc_size = new_count * sizeof(T);
+        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
+        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
+
+        T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
+        if(not new_buffer)
+        {
+            throw std::runtime_error("OFIRemoteMemoryAgent::LocalResize: aligned_alloc failed");
+        }
+        std::memset(new_buffer, 0, new_aligned_size);
+
+        fid_mr *new_mr = this->context.RegisterMemory(new_buffer, new_aligned_size,
+            FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
+        if(not new_mr)
+        {
+            std::free(new_buffer);
+            throw std::runtime_error("OFIRemoteMemoryAgent::LocalResize: fi_mr_reg failed");
+        }
+
+        if(copy_count > 0)
+        {
+            std::memcpy(new_buffer, saved.data(), saved.size());
+        }
 
         this->buffer = new_buffer;
         this->mr = new_mr;
@@ -851,7 +902,7 @@ private:
         std::memset(this->staging, 0, aligned_bytes);
 
         this->staging_mr = this->context.RegisterMemory(this->staging, aligned_bytes,
-            FI_READ | FI_WRITE);
+            FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
         if(not this->staging_mr)
         {
             throw std::runtime_error("OFIRemoteMemoryAgent: fi_mr_reg failed for staging");

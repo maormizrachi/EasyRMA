@@ -108,6 +108,19 @@ public:
 
     virtual void Flush(int target_rank) = 0;
 
+    // Guarantees that all operations previously posted to target_rank have
+    // completed with sufficient ordering and remote visibility that the target
+    // may safely replace, deregister, or free the old remote memory region.
+    virtual void QuiesceTarget(int target_rank)
+    {
+        this->Flush(target_rank);
+    }
+
+    virtual bool SupportsAsyncReallocation() const
+    {
+        return false;
+    }
+
     virtual void SyncLocal()
     {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -137,6 +150,11 @@ public:
         (void)info;
         throw std::runtime_error("RemoteMemoryAgent::UpdateRemoteInfo is not supported by this RMA backend");
     }
+
+    // Pump the transport provider so incoming RDMA operations are processed.
+    // Critical for software-emulated RDMA (e.g. tcp;ofi_rxm with FI_PROGRESS_MANUAL)
+    // where incoming reads/writes/atomics are only serviced during provider calls.
+    virtual void MakeProgress() {}
 
     // Free the current buffer and allocate a fresh one of size new_count.
     // Unlike Resize, this does NOT copy old data — use only when contents are not needed.

@@ -56,6 +56,9 @@ public:
     void PostRDMARead(int target_rank, void *local_addr, size_t bytes,
                       void *desc, uint64_t remote_addr, uint64_t rkey, bool signaled = true);
 
+    void PostFencedRDMARead(int target_rank, void *local_addr, size_t bytes,
+                            void *desc, uint64_t remote_addr, uint64_t rkey);
+
     void PostAtomicCAS(int target_rank,
                        const void *swap_val, void *swap_desc,
                        const void *compare_val, void *compare_desc,
@@ -71,6 +74,7 @@ public:
 
     int PollCompletions(int max = 1);
     void DrainCompletions();
+    void MakeProgress();
 
     void EnsureConnected(const std::vector<int> &peer_world_ranks, MPI_Comm exchange_comm);
 
@@ -91,6 +95,7 @@ private:
     uint64_t mr_key_counter;
     int cq_size;
     int outstanding;
+    int live_mr_count;
     bool freed;
 
     std::vector<fi_addr_t> peer_addrs;

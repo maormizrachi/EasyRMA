@@ -6,6 +6,7 @@
 #include <cassert>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <sys/uio.h>
 
 static void ThrowOFIError(const std::string &context, int err = 0)
@@ -77,7 +78,7 @@ OFIContext::OFIContext(MPI_Comm comm, const std::string &provider_name)
       cq(nullptr), av(nullptr), ep(nullptr),
       inject_size(0), mr_mode(0), mr_endpoint(false),
       mr_key_counter(0), cq_size(DEFAULT_CQ_SIZE),
-      outstanding(0), freed(false)
+      outstanding(0), live_mr_count(0), freed(false)
 {
     MPI_Comm_rank(this->comm, &this->rank);
     MPI_Comm_size(this->comm, &this->size);
@@ -94,7 +95,7 @@ OFIContext::~OFIContext()
     }
 }
 
-static fi_info *ChooseBestProvider(fi_info *list)
+static fi_info *ChooseBestProvider(fi_info *list, const std::string &exclude_family = "")
 {
     fi_info *best = nullptr;
     int best_score = -1;
@@ -102,12 +103,19 @@ static fi_info *ChooseBestProvider(fi_info *list)
     for(fi_info *cur = list; cur != nullptr; cur = cur->next)
     {
         std::string pname = cur->fabric_attr->prov_name ? cur->fabric_attr->prov_name : "";
-        bool virt_addr = (cur->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0;
 
         bool is_rxd = pname.find("ofi_rxd") != std::string::npos;
         bool is_shm = (pname == "shm");
-
         if(is_rxd or is_shm) continue;
+
+        if(not exclude_family.empty())
+        {
+            std::string family = pname;
+            size_t sep = family.find(';');
+            if(sep != std::string::npos)
+                family = family.substr(0, sep);
+            if(family == exclude_family) continue;
+        }
 
         int score = 0;
         if(pname.find("cxi") != std::string::npos) score = 100;
@@ -116,6 +124,7 @@ static fi_info *ChooseBestProvider(fi_info *list)
         else if(pname.find("tcp") != std::string::npos) score = 50;
         else score = 30;
 
+        bool virt_addr = (cur->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0;
         if(virt_addr) score += 10;
 
         if(score > best_score)
@@ -154,10 +163,8 @@ void OFIContext::SetupFabric(const std::string &provider_name)
 
     hints->caps = FI_RMA | FI_ATOMIC;
     hints->ep_attr->type = FI_EP_RDM;
-    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-    hints->domain_attr->threading = FI_THREAD_SAFE;
-    hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
-    hints->domain_attr->data_progress = FI_PROGRESS_AUTO;
+    hints->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
+                                  FI_MR_PROV_KEY | FI_MR_ENDPOINT;
 
     if(not provider_name.empty())
     {
@@ -166,16 +173,6 @@ void OFIContext::SetupFabric(const std::string &provider_name)
 
     fi_info *info_list = nullptr;
     int ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, hints, &info_list);
-    if(ret != 0)
-    {
-        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED;
-        ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, hints, &info_list);
-    }
-    if(ret != 0)
-    {
-        hints->domain_attr->mr_mode = 0;
-        ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, hints, &info_list);
-    }
     fi_freeinfo(hints);
 
     if(ret != 0)
@@ -186,7 +183,8 @@ void OFIContext::SetupFabric(const std::string &provider_name)
     fi_info *chosen = ChooseBestProvider(info_list);
     if(not chosen)
     {
-        chosen = info_list;
+        fi_freeinfo(info_list);
+        ThrowOFIError("fi_getinfo returned no usable providers");
     }
 
     this->fi = fi_dupinfo(chosen);
@@ -195,6 +193,82 @@ void OFIContext::SetupFabric(const std::string &provider_name)
     if(not this->fi)
     {
         ThrowOFIError("fi_dupinfo failed");
+    }
+
+    ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
+    if(ret != 0)
+    {
+        ThrowOFIError("fi_fabric failed", -ret);
+    }
+
+    ret = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
+    if(ret != 0)
+    {
+        std::string failed_provider = this->fi->fabric_attr->prov_name ?
+            this->fi->fabric_attr->prov_name : "";
+        if(this->rank == 0)
+        {
+            fprintf(stderr, "[OFI] provider %s: fi_domain failed (%s), retrying without it\n",
+                    failed_provider.c_str(), fi_strerror(-ret));
+            const char *vnis = std::getenv("SLINGSHOT_VNIS");
+            if(not vnis or vnis[0] == '\0')
+            {
+                fprintf(stderr, "[OFI] WARNING: SLINGSHOT_VNIS is not set. "
+                        "CXI requires it for authentication. Use srun instead of mpirun, "
+                        "or export SLINGSHOT_VNIS manually.\n");
+            }
+        }
+        fi_close(&this->fabric->fid);
+        this->fabric = nullptr;
+        fi_freeinfo(this->fi);
+        this->fi = nullptr;
+
+        std::string exclude_family = failed_provider;
+        size_t sep = exclude_family.find(';');
+        if(sep != std::string::npos)
+            exclude_family = exclude_family.substr(0, sep);
+
+        fi_info *hints2 = fi_allocinfo();
+        if(not hints2)
+            ThrowOFIError("fi_allocinfo failed (retry)");
+        hints2->caps = FI_RMA | FI_ATOMIC;
+        hints2->ep_attr->type = FI_EP_RDM;
+        hints2->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
+                                       FI_MR_PROV_KEY | FI_MR_ENDPOINT;
+
+        fi_info *info_list2 = nullptr;
+        ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, hints2, &info_list2);
+        fi_freeinfo(hints2);
+        if(ret != 0)
+        {
+            ThrowOFIError("fi_getinfo failed on retry", -ret);
+        }
+
+        fi_info *chosen2 = ChooseBestProvider(info_list2, exclude_family);
+        if(not chosen2)
+        {
+            fi_freeinfo(info_list2);
+            ThrowOFIError("no fallback provider available after excluding " + exclude_family);
+        }
+
+        this->fi = fi_dupinfo(chosen2);
+        fi_freeinfo(info_list2);
+
+        if(not this->fi)
+        {
+            ThrowOFIError("fi_dupinfo failed (retry)");
+        }
+
+        ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
+        if(ret != 0)
+        {
+            ThrowOFIError("fi_fabric failed (retry)", -ret);
+        }
+        ret = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
+        if(ret != 0)
+        {
+            ThrowOFIError("fi_domain failed (retry)", -ret);
+        }
     }
 
     this->mr_mode = this->fi->domain_attr->mr_mode;
@@ -208,18 +282,14 @@ void OFIContext::SetupFabric(const std::string &provider_name)
         std::string component = OFIProviderComponent(provider);
         fprintf(stderr, "[OFI] component: %s (provider: %s)\n",
                 component.c_str(), provider.c_str());
-    }
-
-    ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
-    if(ret != 0)
-    {
-        ThrowOFIError("fi_fabric failed", -ret);
-    }
-
-    ret = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
-    if(ret != 0)
-    {
-        ThrowOFIError("fi_domain failed", -ret);
+        fprintf(stderr, "[OFI] mr_mode=0x%x prov_key=%d endpoint=%d virt_addr=%d "
+                "mr_key_size=%zu mr_cnt=%zu\n",
+                static_cast<unsigned>(this->fi->domain_attr->mr_mode),
+                !!(this->fi->domain_attr->mr_mode & FI_MR_PROV_KEY),
+                !!(this->fi->domain_attr->mr_mode & FI_MR_ENDPOINT),
+                !!(this->fi->domain_attr->mr_mode & FI_MR_VIRT_ADDR),
+                this->fi->domain_attr->mr_key_size,
+                this->fi->domain_attr->mr_cnt);
     }
 
     fi_cq_attr cq_attr{};
@@ -308,7 +378,8 @@ fid_mr *OFIContext::RegisterMemory(void *buf, size_t bytes, uint64_t access)
     fid_mr *mr = nullptr;
 
     uint64_t requested_key = 0;
-    if(not (this->mr_mode & FI_MR_PROV_KEY))
+    bool prov_key = (this->mr_mode & FI_MR_PROV_KEY) != 0;
+    if(not prov_key)
     {
         requested_key = this->mr_key_counter++;
     }
@@ -317,7 +388,15 @@ fid_mr *OFIContext::RegisterMemory(void *buf, size_t bytes, uint64_t access)
                         0, requested_key, 0, &mr, nullptr);
     if(ret != 0)
     {
-        ThrowOFIError("fi_mr_reg failed", -ret);
+        char access_hex[32];
+        snprintf(access_hex, sizeof(access_hex), "0x%llx", static_cast<unsigned long long>(access));
+        std::string detail = "fi_mr_reg failed (bytes=" + std::to_string(bytes) +
+            ", access=" + access_hex +
+            ", key=" + std::to_string(requested_key) +
+            ", prov_key=" + std::to_string(prov_key) +
+            ", mr_key_counter=" + std::to_string(this->mr_key_counter) +
+            ", live_mrs=" + std::to_string(this->live_mr_count) + ")";
+        ThrowOFIError(detail, -ret);
     }
 
     if(this->mr_endpoint)
@@ -336,14 +415,25 @@ fid_mr *OFIContext::RegisterMemory(void *buf, size_t bytes, uint64_t access)
         }
     }
 
+    this->live_mr_count++;
     return mr;
 }
 
 void OFIContext::DeregisterMemory(fid_mr *mr)
 {
-    if(mr)
+    if(not mr)
     {
-        fi_close(&mr->fid);
+        return;
+    }
+
+    int ret = fi_close(&mr->fid);
+    if(ret != 0)
+    {
+        fprintf(stderr, "[OFI] WARNING: fi_close(mr) failed: %s\n", fi_strerror(-ret));
+    }
+    else
+    {
+        this->live_mr_count--;
     }
 }
 
@@ -484,6 +574,48 @@ void OFIContext::PostRDMARead(int target_rank, void *local_addr, size_t bytes,
     this->outstanding++;
 }
 
+void OFIContext::PostFencedRDMARead(int target_rank, void *local_addr, size_t bytes,
+                                    void *desc, uint64_t remote_addr, uint64_t rkey)
+{
+    this->EnsureCQSpace();
+
+    iovec iov{};
+    iov.iov_base = local_addr;
+    iov.iov_len = bytes;
+
+    void *descs[1] = {desc};
+
+    fi_rma_iov rma_iov{};
+    rma_iov.addr = remote_addr;
+    rma_iov.len = bytes;
+    rma_iov.key = rkey;
+
+    fi_msg_rma msg{};
+    msg.msg_iov = &iov;
+    msg.desc = descs;
+    msg.iov_count = 1;
+    msg.addr = this->peer_addrs[target_rank];
+    msg.rma_iov = &rma_iov;
+    msg.rma_iov_count = 1;
+
+    ssize_t ret;
+    do
+    {
+        ret = fi_readmsg(this->ep, &msg, FI_FENCE | FI_COMPLETION);
+        if(ret == -FI_EAGAIN)
+        {
+            this->PollCompletions(1);
+        }
+    }
+    while(ret == -FI_EAGAIN);
+
+    if(ret != 0)
+    {
+        ThrowOFIError("fi_readmsg (fenced) failed", static_cast<int>(-ret));
+    }
+    this->outstanding++;
+}
+
 void OFIContext::PostAtomicCAS(int target_rank,
                                const void *swap_val, void *swap_desc,
                                const void *compare_val, void *compare_desc,
@@ -530,7 +662,7 @@ void OFIContext::PostAtomicCAS(int target_rank,
         ret = fi_compare_atomicmsg(this->ep, &msg,
                                     &compare_iov, compare_descs, 1,
                                     &result_iov, result_descs, 1,
-                                    FI_COMPLETION);
+                                    FI_FENCE | FI_COMPLETION);
         if(ret == -FI_EAGAIN)
         {
             this->PollCompletions(1);
@@ -584,7 +716,7 @@ void OFIContext::PostAtomicFetchAdd(int target_rank,
     {
         ret = fi_fetch_atomicmsg(this->ep, &msg,
                                   &result_iov, result_descs, 1,
-                                  FI_COMPLETION);
+                                  FI_FENCE | FI_COMPLETION);
         if(ret == -FI_EAGAIN)
         {
             this->PollCompletions(1);
@@ -634,6 +766,35 @@ void OFIContext::DrainCompletions()
         {
             int flag;
             MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, MPI_STATUS_IGNORE);
+        }
+    }
+}
+
+void OFIContext::MakeProgress()
+{
+    if(this->outstanding > 0)
+    {
+        this->PollCompletions(std::min(16, this->outstanding));
+    }
+    else
+    {
+        struct fi_cq_entry entry;
+        ssize_t ret = fi_cq_read(this->cq, &entry, 1);
+        if(ret > 0)
+        {
+            return;
+        }
+        if(ret < 0 && ret != -FI_EAGAIN)
+        {
+            if(ret == -FI_EAVAIL)
+            {
+                fi_cq_err_entry err{};
+                fi_cq_readerr(this->cq, &err, 0);
+                ThrowOFIError("CQ error during MakeProgress: " +
+                    std::string(fi_cq_strerror(this->cq, err.prov_errno, err.err_data, nullptr, 0)) +
+                    " (err=" + std::to_string(err.err) + ", prov_errno=" + std::to_string(err.prov_errno) + ")");
+            }
+            ThrowOFIError("fi_cq_read failed during MakeProgress", static_cast<int>(-ret));
         }
     }
 }

@@ -416,6 +416,26 @@ public:
         this->ResetStaging();
     }
 
+    void QuiesceTarget(int target_rank) override
+    {
+        if(target_rank == this->my_agent_rank)
+        {
+            return;
+        }
+        int world_target = this->rank_map[target_rank];
+        const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+        // Signaled read on the same RC QP orders after all prior writes/atomics.
+        this->context.PostRDMARead(world_target, this->scratch, 1, this->ScratchLkey(),
+                                   remote.addr, remote.rkey, true);
+        this->context.DrainCompletionsForTarget(world_target);
+        this->ResetStaging();
+    }
+
+    bool SupportsAsyncReallocation() const override
+    {
+        return this->SupportsLocalResize();
+    }
+
     void Resize(size_t new_count) override
     {
         if(not this->owns_memory)
@@ -432,7 +452,7 @@ public:
         size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
 
         T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
-        if(not new_buffer and new_count > 0)
+        if(not new_buffer)
         {
             throw std::runtime_error("IBVRemoteMemoryAgent::Resize: aligned_alloc failed");
         }
@@ -492,43 +512,33 @@ public:
         }
         this->context.DrainCompletions();
 
-        T *old_buffer = this->buffer;
-        ibv_mr *old_mr = this->mr;
         size_t old_count = this->count;
-
-        size_t new_alloc_size = new_count * sizeof(T);
-        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
-        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
-
-        T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
-        if(not new_buffer and new_count > 0)
-        {
-            throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: aligned_alloc failed");
-        }
-        std::memset(new_buffer, 0, new_aligned_size);
-
-        ibv_mr *new_mr = ibv_reg_mr(this->context.GetPD(), new_buffer, new_aligned_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
-        if(not new_mr)
-        {
-            std::free(new_buffer);
-            throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: ibv_reg_mr failed");
-        }
-
         size_t copy_count = std::min(old_count, new_count);
+
+        // Save active data locally before releasing all MR resources.
+        // Deregistering old MRs first avoids exhausting provider key slots.
+        std::vector<unsigned char> saved;
         if(copy_count > 0)
         {
-            std::memcpy(new_buffer, old_buffer, copy_count * sizeof(T));
+            saved.resize(copy_count * sizeof(T));
+            std::memcpy(saved.data(), this->buffer, saved.size());
         }
 
-        if(old_mr)
+        // Release staging, retired buffers, and old MR before registering new
+        if(this->staging_mr)
         {
-            ibv_dereg_mr(old_mr);
+            ibv_dereg_mr(this->staging_mr);
+            this->staging_mr = nullptr;
         }
-        if(old_buffer)
+        if(this->staging)
         {
-            rma_detail::advise_dontneed(old_buffer, old_count * sizeof(T));
-            std::free(old_buffer);
+            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
+            std::free(this->staging);
+            this->staging = nullptr;
         }
+        this->staging_size = 0;
+        this->staging_next = 0;
+        this->staging_active_target = -1;
 
         for(RetiredBuffer &retired : this->retired_buffers)
         {
@@ -544,20 +554,42 @@ public:
         }
         this->retired_buffers.clear();
 
-        if(this->staging_mr)
+        if(this->mr)
         {
-            ibv_dereg_mr(this->staging_mr);
-            this->staging_mr = nullptr;
+            ibv_dereg_mr(this->mr);
+            this->mr = nullptr;
         }
-        if(this->staging)
+        if(this->buffer)
         {
-            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
-            std::free(this->staging);
-            this->staging = nullptr;
+            rma_detail::advise_dontneed(this->buffer, old_count * sizeof(T));
+            std::free(this->buffer);
+            this->buffer = nullptr;
         }
-        this->staging_size = 0;
-        this->staging_next = 0;
-        this->staging_active_target = -1;
+
+        // Allocate and register new buffer with freed MR slots
+        size_t new_alloc_size = new_count * sizeof(T);
+        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
+        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
+
+        T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
+        if(not new_buffer)
+        {
+            throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: aligned_alloc failed");
+        }
+        std::memset(new_buffer, 0, new_aligned_size);
+
+        ibv_mr *new_mr = ibv_reg_mr(this->context.GetPD(), new_buffer, new_aligned_size,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        if(not new_mr)
+        {
+            std::free(new_buffer);
+            throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: ibv_reg_mr failed");
+        }
+
+        if(copy_count > 0)
+        {
+            std::memcpy(new_buffer, saved.data(), saved.size());
+        }
 
         this->buffer = new_buffer;
         this->mr = new_mr;
@@ -874,7 +906,7 @@ private:
             throw std::runtime_error("IBVRemoteMemoryAgent: aligned_alloc failed for scratch");
         }
 
-        this->scratch_mr = ibv_reg_mr(this->context.GetPD(), this->scratch, 64, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        this->scratch_mr = ibv_reg_mr(this->context.GetPD(), this->scratch, 64, IBV_ACCESS_LOCAL_WRITE);
         if(not this->scratch_mr)
         {
             throw std::runtime_error("IBVRemoteMemoryAgent: ibv_reg_mr failed for scratch");
@@ -909,7 +941,7 @@ private:
             throw std::runtime_error("IBVRemoteMemoryAgent: aligned_alloc failed for scratch");
         }
 
-        this->scratch_mr = ibv_reg_mr(this->context.GetPD(), this->scratch, 64, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        this->scratch_mr = ibv_reg_mr(this->context.GetPD(), this->scratch, 64, IBV_ACCESS_LOCAL_WRITE);
         if(not this->scratch_mr)
         {
             throw std::runtime_error("IBVRemoteMemoryAgent: ibv_reg_mr failed for scratch");
