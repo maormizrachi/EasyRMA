@@ -8,6 +8,9 @@
 #ifdef __WITH_IBV
 #include "IBVRemoteMemoryAgent.hpp"
 #endif
+#ifdef __WITH_OFI
+#include "OFIRemoteMemoryAgent.hpp"
+#endif
 
 #include <memory>
 #include <stdexcept>
@@ -16,6 +19,7 @@ enum class RDMA_Type
 {
     MPI_RMA,
     IBV_RDMA,
+    OFI_RDMA,
     AUTO_RDMA
 };
 
@@ -26,10 +30,10 @@ public:
 
     static RDMA_Type ResolveAutoRDMA()
     {
-#ifdef __WITH_IBV
+#ifdef __WITH_OFI
+        return RDMA_Type::OFI_RDMA;
+#elif defined(__WITH_IBV)
         return RDMA_Type::IBV_RDMA;
-#elif defined(OPEN_MPI)
-        return RDMA_Type::MPI_RMA;
 #else
         return RDMA_Type::MPI_RMA;
 #endif
@@ -52,6 +56,12 @@ public:
                 return CreateIBV<T>(count, comm);
 #else
                 throw std::runtime_error("RMAFactory: IBV_RDMA selected but __WITH_IBV is not enabled");
+#endif
+            case RDMA_Type::OFI_RDMA:
+#ifdef __WITH_OFI
+                return CreateOFI<T>(count, comm);
+#else
+                throw std::runtime_error("RMAFactory: OFI_RDMA selected but __WITH_OFI is not enabled");
 #endif
             default:
                 break;
@@ -82,6 +92,12 @@ public:
 #else
                 throw std::runtime_error("RMAFactory: IBV_RDMA selected but __WITH_IBV is not enabled");
 #endif
+            case RDMA_Type::OFI_RDMA:
+#ifdef __WITH_OFI
+                return CreateOFIOver<T>(user_buffer, count, comm);
+#else
+                throw std::runtime_error("RMAFactory: OFI_RDMA selected but __WITH_OFI is not enabled");
+#endif
             default:
                 break;
         }
@@ -90,7 +106,7 @@ public:
 
 private:
 #ifdef __WITH_IBV
-    static std::shared_ptr<IBVContext> &GetSharedContext()
+    static std::shared_ptr<IBVContext> &GetSharedIBVContext()
     {
         static std::shared_ptr<IBVContext> context;
         return context;
@@ -99,7 +115,7 @@ private:
     template<typename T>
     static std::unique_ptr<RemoteMemoryAgent<T>> CreateIBV(size_t count, MPI_Comm agent_comm)
     {
-        auto &ctx = GetSharedContext();
+        auto &ctx = GetSharedIBVContext();
         if(not ctx)
         {
             ctx = std::make_shared<IBVContext>(MPI_COMM_WORLD);
@@ -110,12 +126,42 @@ private:
     template<typename T>
     static std::unique_ptr<RemoteMemoryAgent<T>> CreateIBVOver(T *user_buffer, size_t count, MPI_Comm agent_comm)
     {
-        auto &ctx = GetSharedContext();
+        auto &ctx = GetSharedIBVContext();
         if(not ctx)
         {
             ctx = std::make_shared<IBVContext>(MPI_COMM_WORLD);
         }
         return std::make_unique<IBVRemoteMemoryAgent<T>>(user_buffer, count, *ctx, agent_comm);
+    }
+#endif
+
+#ifdef __WITH_OFI
+    static std::shared_ptr<OFIContext> &GetSharedOFIContext()
+    {
+        static std::shared_ptr<OFIContext> context;
+        return context;
+    }
+
+    template<typename T>
+    static std::unique_ptr<RemoteMemoryAgent<T>> CreateOFI(size_t count, MPI_Comm agent_comm)
+    {
+        auto &ctx = GetSharedOFIContext();
+        if(not ctx)
+        {
+            ctx = std::make_shared<OFIContext>(MPI_COMM_WORLD);
+        }
+        return OFIRemoteMemoryAgent<T>::Create(count, *ctx, agent_comm);
+    }
+
+    template<typename T>
+    static std::unique_ptr<RemoteMemoryAgent<T>> CreateOFIOver(T *user_buffer, size_t count, MPI_Comm agent_comm)
+    {
+        auto &ctx = GetSharedOFIContext();
+        if(not ctx)
+        {
+            ctx = std::make_shared<OFIContext>(MPI_COMM_WORLD);
+        }
+        return std::make_unique<OFIRemoteMemoryAgent<T>>(user_buffer, count, *ctx, agent_comm);
     }
 #endif
 };

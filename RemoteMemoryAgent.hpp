@@ -30,7 +30,7 @@ namespace rma_detail {
 struct RemoteBufferInfo
 {
     uint64_t addr = 0;
-    uint32_t rkey = 0;
+    uint64_t rkey = 0;
     size_t count = 0;
 };
 
