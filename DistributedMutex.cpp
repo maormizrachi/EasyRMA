@@ -57,6 +57,7 @@ void DistributedMutex::Lock(void)
         {
             break;
         }
+        this->agent->MakeProgress();
         MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, this->comm, &probe_flag, MPI_STATUS_IGNORE);
     }
 }
@@ -67,6 +68,14 @@ void DistributedMutex::Unlock(void)
     const int one = 1;
     int old;
     this->agent->CompareAndSwap(zero, one, old, this->rank, 0);
+}
+
+void DistributedMutex::MakeProgress(void)
+{
+    if(this->agent)
+    {
+        this->agent->MakeProgress();
+    }
 }
 
 #endif // __WITH_MPI

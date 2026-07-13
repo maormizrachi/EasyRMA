@@ -152,8 +152,8 @@ public:
     }
 
     // Pump the transport provider so incoming RDMA operations are processed.
-    // Critical for software-emulated RDMA (e.g. tcp;ofi_rxm with FI_PROGRESS_MANUAL)
-    // where incoming reads/writes/atomics are only serviced during provider calls.
+    // Critical for OFI utility providers such as verbs;ofi_rxm when provider
+    // progress is manual.
     virtual void MakeProgress() {}
 
     // Free the current buffer and allocate a fresh one of size new_count.

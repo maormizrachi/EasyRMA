@@ -9,6 +9,7 @@
 #include <rdma/fi_rma.h>
 #include <rdma/fi_atomic.h>
 #include <rdma/fi_cm.h>
+#include <rdma/fi_eq.h>
 #include <rdma/fi_errno.h>
 #include <mpi.h>
 #include <vector>
@@ -31,8 +32,12 @@ public:
 
     ~OFIContext();
 
+    static bool HasUsableProvider(const std::string &provider_name = "");
+
     fid_domain *GetDomain() const { return this->domain; }
     fid_ep *GetEP() const { return this->ep; }
+    fid_ep *GetEP(int target_rank) const;
+    bool IsConnectedMode() const { return this->connected_mode; }
     fid_cq *GetCQ() const { return this->cq; }
     MPI_Comm GetComm() const { return this->comm; }
     int GetRank() const { return this->rank; }
@@ -97,13 +102,25 @@ private:
     int outstanding;
     int live_mr_count;
     bool freed;
+    bool connected_mode;
 
     std::vector<fi_addr_t> peer_addrs;
     std::vector<bool> peer_connected;
 
+    fid_pep *pep;
+    fid_eq *eq;
+    std::vector<fid_ep*> peer_eps;
+
     void SetupFabric(const std::string &provider_name);
     void ExchangeAddresses();
+    void EstablishConnections();
+    fid_ep *CreateBoundEndpoint(fi_info *ep_info);
+    void BindMemoryToEndpoint(fid_mr *mr, fid_ep *target_ep);
+    void BindMemoryToEndpoints(fid_mr *mr);
     void EnsureCQSpace();
+
+    fid_ep *ResolveEP(int target_rank) const;
+    fi_addr_t ResolveAddr(int target_rank) const;
 };
 
 #endif // __WITH_OFI

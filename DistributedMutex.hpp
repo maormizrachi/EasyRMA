@@ -19,6 +19,8 @@ public:
 
     void Unlock(void);
 
+    void MakeProgress(void);
+
     void Destroy(void);
 
 private:

@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <memory>
+#include <type_traits>
 
 template<typename T>
 class OFIRemoteMemoryAgent : public RemoteMemoryAgent<T>
@@ -338,36 +339,37 @@ public:
     {
         if constexpr(sizeof(T) <= 8)
         {
+            if(target_rank == this->my_agent_rank)
+            {
+                this->CompareAndSwapLocal(desired, expected, old_value, target_disp);
+                return;
+            }
+
             int world_target = this->rank_map[target_rank];
             const OFIRemoteRegion &remote = this->remote_regions[target_rank];
             uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
+            const unsigned shift = this->AtomicWordShift(remote_addr);
+            remote_addr = this->AtomicWordAddress(remote_addr);
 
             // scratch layout: [0]=result, [1]=swap, [2]=compare
             // All operands must reside in registered memory for fi_compare_atomic.
             this->scratch[1] = 0;
             this->scratch[2] = 0;
-            std::memcpy(&this->scratch[1], &desired, sizeof(T));
-            std::memcpy(&this->scratch[2], &expected, sizeof(T));
-
-            fi_datatype dtype = (sizeof(T) <= 4) ? FI_UINT32 : FI_UINT64;
-
-            if constexpr(sizeof(T) == 4)
-            {
-                remote_addr = (remote_addr / 8) * 8;
-            }
+            this->scratch[1] = this->AtomicBits(desired) << shift;
+            this->scratch[2] = this->AtomicBits(expected) << shift;
 
             this->context.PostAtomicCAS(world_target,
                 &this->scratch[1], this->ScratchDesc(),
                 &this->scratch[2], this->ScratchDesc(),
                 &this->scratch[0], this->ScratchDesc(),
-                remote_addr, remote.key, dtype, true);
+                remote_addr, remote.key, FI_UINT64, true);
 
             if(flush)
             {
                 this->context.DrainCompletions();
             }
 
-            std::memcpy(&old_value, &this->scratch[0], sizeof(T));
+            this->StoreAtomicBits(old_value, this->scratch[0] >> shift);
         }
         else
         {
@@ -381,26 +383,26 @@ public:
     {
         if constexpr(sizeof(T) <= 8)
         {
+            if(target_rank == this->my_agent_rank)
+            {
+                return this->FetchAndAddLocal(addend, target_disp);
+            }
+
             int world_target = this->rank_map[target_rank];
             const OFIRemoteRegion &remote = this->remote_regions[target_rank];
             uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
+            const unsigned shift = this->AtomicWordShift(remote_addr);
+            remote_addr = this->AtomicWordAddress(remote_addr);
 
             // scratch layout: [0]=result, [1]=addend
             // All operands must reside in registered memory for fi_fetch_atomic.
             this->scratch[1] = 0;
-            std::memcpy(&this->scratch[1], &addend, sizeof(T));
-
-            fi_datatype dtype = (sizeof(T) <= 4) ? FI_UINT32 : FI_UINT64;
-
-            if constexpr(sizeof(T) == 4)
-            {
-                remote_addr = (remote_addr / 8) * 8;
-            }
+            this->scratch[1] = this->AtomicAddBits(addend) << shift;
 
             this->context.PostAtomicFetchAdd(world_target,
                 &this->scratch[1], this->ScratchDesc(),
                 &this->scratch[0], this->ScratchDesc(),
-                remote_addr, remote.key, dtype, true);
+                remote_addr, remote.key, FI_UINT64, true);
 
             if(flush)
             {
@@ -408,7 +410,7 @@ public:
             }
 
             T old_value;
-            std::memcpy(&old_value, &this->scratch[0], sizeof(T));
+            this->StoreAtomicBits(old_value, this->scratch[0] >> shift);
             return old_value;
         }
         else
@@ -420,6 +422,13 @@ public:
 
     void Flush(int target_rank) override
     {
+        if(target_rank == this->my_agent_rank)
+        {
+            this->SyncLocal();
+            this->ResetStaging();
+            return;
+        }
+
         int world_target = this->rank_map[target_rank];
         const OFIRemoteRegion &remote = this->remote_regions[target_rank];
         this->context.PostRDMARead(world_target, this->scratch, 1,
@@ -785,6 +794,108 @@ private:
     void *ScratchDesc() const { return fi_mr_desc(this->scratch_mr); }
     void *StagingDesc() const { return fi_mr_desc(this->staging_mr); }
     uint64_t BufferKey() const { return fi_mr_key(this->mr); }
+
+    static uint64_t AtomicValueMask()
+    {
+        if constexpr(sizeof(T) >= sizeof(uint64_t))
+        {
+            return ~uint64_t{0};
+        }
+        else
+        {
+            return (uint64_t{1} << (sizeof(T) * 8)) - 1;
+        }
+    }
+
+    static uint64_t AtomicBits(const T &value)
+    {
+        uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(T));
+        return bits & AtomicValueMask();
+    }
+
+    static uint64_t AtomicAddBits(const T &value)
+    {
+        if constexpr(std::is_integral<T>::value and std::is_signed<T>::value and sizeof(T) < sizeof(uint64_t))
+        {
+            return static_cast<uint64_t>(static_cast<int64_t>(value)) & AtomicValueMask();
+        }
+        else
+        {
+            return AtomicBits(value);
+        }
+    }
+
+    static void StoreAtomicBits(T &value, uint64_t bits)
+    {
+        bits &= AtomicValueMask();
+        std::memcpy(&value, &bits, sizeof(T));
+    }
+
+    static uint64_t AtomicWordAddress(uint64_t addr)
+    {
+        return addr & ~uint64_t{7};
+    }
+
+    static unsigned AtomicWordShift(uint64_t addr)
+    {
+        return static_cast<unsigned>((addr & uint64_t{7}) * 8);
+    }
+
+    void CompareAndSwapLocal(const T &desired, const T &expected, T &old_value, size_t target_disp)
+    {
+        uint64_t addr = reinterpret_cast<uint64_t>(this->buffer + target_disp);
+        const unsigned shift = AtomicWordShift(addr);
+        uint64_t *word = reinterpret_cast<uint64_t*>(AtomicWordAddress(addr));
+        const uint64_t value_mask = AtomicValueMask();
+        const uint64_t mask = value_mask << shift;
+        const uint64_t expected_bits = (AtomicBits(expected) << shift) & mask;
+        const uint64_t desired_bits = (AtomicBits(desired) << shift) & mask;
+
+        uint64_t observed = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        while((observed & mask) == expected_bits)
+        {
+            uint64_t replacement = (observed & ~mask) | desired_bits;
+            uint64_t compare = observed;
+            if(__atomic_compare_exchange_n(word, &compare, replacement, false,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            {
+                break;
+            }
+            observed = compare;
+        }
+
+        StoreAtomicBits(old_value, (observed & mask) >> shift);
+    }
+
+    T FetchAndAddLocal(const T &addend, size_t target_disp)
+    {
+        uint64_t addr = reinterpret_cast<uint64_t>(this->buffer + target_disp);
+        const unsigned shift = AtomicWordShift(addr);
+        uint64_t *word = reinterpret_cast<uint64_t*>(AtomicWordAddress(addr));
+        const uint64_t value_mask = AtomicValueMask();
+        const uint64_t mask = value_mask << shift;
+        const uint64_t add_bits = AtomicAddBits(addend);
+
+        uint64_t observed = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        while(true)
+        {
+            uint64_t old_bits = (observed & mask) >> shift;
+            uint64_t new_bits = (old_bits + add_bits) & value_mask;
+            uint64_t replacement = (observed & ~mask) | (new_bits << shift);
+            uint64_t compare = observed;
+            if(__atomic_compare_exchange_n(word, &compare, replacement, false,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            {
+                break;
+            }
+            observed = compare;
+        }
+
+        T old_value;
+        StoreAtomicBits(old_value, (observed & mask) >> shift);
+        return old_value;
+    }
 
     void ResetStaging() const
     {

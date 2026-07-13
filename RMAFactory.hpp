@@ -32,11 +32,73 @@ public:
     {
 #ifdef __WITH_OFI
         return RDMA_Type::OFI_RDMA;
-#elif defined(__WITH_IBV)
-        return RDMA_Type::IBV_RDMA;
 #else
         return RDMA_Type::MPI_RMA;
 #endif
+    }
+
+    static bool IsBackendAvailable(RDMA_Type type, MPI_Comm comm)
+    {
+        if(type == RDMA_Type::AUTO_RDMA)
+        {
+            type = ResolveAutoRDMA();
+        }
+
+        int local_available = 0;
+        switch(type)
+        {
+            case RDMA_Type::MPI_RMA:
+                local_available = 1;
+                break;
+            case RDMA_Type::IBV_RDMA:
+#ifdef __WITH_IBV
+                local_available = 1;
+#else
+                local_available = 0;
+#endif
+                break;
+            case RDMA_Type::OFI_RDMA:
+#ifdef __WITH_OFI
+                local_available = OFIContext::HasUsableProvider() ? 1 : 0;
+#else
+                local_available = 0;
+#endif
+                break;
+            default:
+                local_available = 0;
+                break;
+        }
+
+        int global_available = 0;
+        MPI_Allreduce(&local_available, &global_available, 1, MPI_INT, MPI_MIN, comm);
+        return global_available != 0;
+    }
+
+    static void MakeProgress(RDMA_Type type)
+    {
+        if(type == RDMA_Type::AUTO_RDMA)
+        {
+            type = ResolveAutoRDMA();
+        }
+
+        switch(type)
+        {
+            case RDMA_Type::OFI_RDMA:
+#ifdef __WITH_OFI
+            {
+                auto &ctx = GetSharedOFIContext();
+                if(ctx)
+                {
+                    ctx->MakeProgress();
+                }
+                break;
+            }
+#else
+                break;
+#endif
+            default:
+                break;
+        }
     }
 
     template<typename T>
