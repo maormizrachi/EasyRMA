@@ -59,7 +59,7 @@ public:
                 break;
             case RDMA_Type::OFI_RDMA:
 #ifdef __WITH_OFI
-                local_available = OFIContext::HasUsableProvider() ? 1 : 0;
+                local_available = OFIContext::HasUsableProvider("", comm) ? 1 : 0;
 #else
                 local_available = 0;
 #endif
@@ -72,6 +72,42 @@ public:
         int global_available = 0;
         MPI_Allreduce(&local_available, &global_available, 1, MPI_INT, MPI_MIN, comm);
         return global_available != 0;
+    }
+
+    static void Initialize(RDMA_Type type, MPI_Comm comm)
+    {
+        if(type == RDMA_Type::AUTO_RDMA)
+        {
+            type = ResolveAutoRDMA();
+        }
+
+        switch(type)
+        {
+            case RDMA_Type::OFI_RDMA:
+#ifdef __WITH_OFI
+            {
+                auto &ctx = GetSharedOFIContext();
+                int local_initialized = ctx ? 1 : 0;
+                int min_initialized = 0;
+                int max_initialized = 0;
+                MPI_Allreduce(&local_initialized, &min_initialized, 1, MPI_INT, MPI_MIN, comm);
+                MPI_Allreduce(&local_initialized, &max_initialized, 1, MPI_INT, MPI_MAX, comm);
+                if(min_initialized != max_initialized)
+                {
+                    throw std::runtime_error("RMAFactory::Initialize: OFI context is initialized on only some ranks");
+                }
+                if(not ctx)
+                {
+                    ctx = std::make_shared<OFIContext>(comm);
+                }
+                break;
+            }
+#else
+                throw std::runtime_error("RMAFactory: OFI_RDMA selected but __WITH_OFI is not enabled");
+#endif
+            default:
+                break;
+        }
     }
 
     static void MakeProgress(RDMA_Type type)

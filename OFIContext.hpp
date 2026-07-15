@@ -32,7 +32,8 @@ public:
 
     ~OFIContext();
 
-    static bool HasUsableProvider(const std::string &provider_name = "");
+    static bool HasUsableProvider(const std::string &provider_name = "",
+                                  MPI_Comm comm = MPI_COMM_NULL);
 
     fid_domain *GetDomain() const { return this->domain; }
     fid_ep *GetEP() const { return this->ep; }

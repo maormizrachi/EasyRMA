@@ -8,7 +8,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
+#include <exception>
 #include <sys/uio.h>
+
+#if defined(__WITH_PALS) && __has_include(<pals.h>) && __has_include(<rdma/fi_cxi_ext.h>)
+#define STORM_WITH_CXI_PALS_AUTH 1
+extern "C" {
+#include <pals.h>
+}
+#include <rdma/fi_cxi_ext.h>
+#endif
 
 static void ThrowOFIError(const std::string &context, int err = 0)
 {
@@ -85,6 +94,11 @@ OFIContext::OFIContext(MPI_Comm comm, const std::string &provider_name)
     MPI_Comm_rank(this->comm, &this->rank);
     MPI_Comm_size(this->comm, &this->size);
 
+    if(this->rank == 0)
+    {
+        fprintf(stderr, "[OFI] initializing shared context on %d ranks\n", this->size);
+    }
+
     this->SetupFabric(provider_name);
     if(this->connected_mode)
     {
@@ -131,6 +145,176 @@ static std::string ProviderBase(const std::string &provider)
     return base;
 }
 
+static bool IsCXIProvider(const fi_info *info)
+{
+    return ProviderBase(ProviderName(info)) == "cxi";
+}
+
+static std::string DomainName(const fi_info *info)
+{
+    if(not info or not info->domain_attr or not info->domain_attr->name)
+    {
+        return "";
+    }
+    return info->domain_attr->name;
+}
+
+#ifdef STORM_WITH_CXI_PALS_AUTH
+struct CXIAuthKeySelection
+{
+    bool available = false;
+    cxi_auth_key key{};
+    std::string device_name;
+    int profile_count = 0;
+    std::string error;
+};
+
+static std::string PALSErrorMessage(pals_state_t *state, const char *call)
+{
+    std::string message = std::string(call) + " failed";
+    if(state)
+    {
+        const char *detail = pals_errmsg(state);
+        if(detail and detail[0] != '\0')
+        {
+            message += ": ";
+            message += detail;
+        }
+    }
+    return message;
+}
+
+static CXIAuthKeySelection LoadCXIAuthKeyFromPALS(const fi_info *info)
+{
+    CXIAuthKeySelection selection;
+
+    pals_state_t *state = nullptr;
+    pals_rc_t rc = pals_init2(&state);
+    if(rc != PALS_OK)
+    {
+        selection.error = PALSErrorMessage(state, "pals_init2");
+        if(state)
+        {
+            pals_fini(state);
+        }
+        return selection;
+    }
+
+    pals_comm_profile_t *profiles = nullptr;
+    int nprofiles = 0;
+    rc = pals_get_comm_profiles(state, &profiles, &nprofiles);
+    if(rc != PALS_OK)
+    {
+        selection.error = PALSErrorMessage(state, "pals_get_comm_profiles");
+        std::free(profiles);
+        pals_fini(state);
+        return selection;
+    }
+
+    selection.profile_count = nprofiles;
+    const std::string domain_name = DomainName(info);
+    const pals_comm_profile_t *chosen = nullptr;
+
+    for(int i = 0; i < nprofiles; ++i)
+    {
+        if(profiles[i].nvnis == 0)
+        {
+            continue;
+        }
+
+        if(domain_name.empty() or domain_name == profiles[i].device_name)
+        {
+            chosen = &profiles[i];
+            break;
+        }
+    }
+
+    if(not chosen)
+    {
+        for(int i = 0; i < nprofiles; ++i)
+        {
+            if(profiles[i].nvnis > 0)
+            {
+                chosen = &profiles[i];
+                break;
+            }
+        }
+    }
+
+    if(chosen)
+    {
+        selection.available = true;
+        selection.key.svc_id = chosen->svc_id;
+        selection.key.vni = chosen->vnis[0];
+        selection.device_name = chosen->device_name;
+    }
+    else
+    {
+        selection.error = "no PALS communication profile with a VNI";
+        if(not domain_name.empty())
+        {
+            selection.error += " for domain ";
+            selection.error += domain_name;
+        }
+    }
+
+    std::free(profiles);
+    pals_fini(state);
+    return selection;
+}
+#endif
+
+static void ConfigureCXIAuthKey(fi_info *info, int rank)
+{
+    if(not IsCXIProvider(info) or not info or not info->domain_attr)
+    {
+        return;
+    }
+
+    if(info->domain_attr->auth_key and info->domain_attr->auth_key_size != 0)
+    {
+        return;
+    }
+
+#ifdef STORM_WITH_CXI_PALS_AUTH
+    CXIAuthKeySelection selection = LoadCXIAuthKeyFromPALS(info);
+    if(not selection.available)
+    {
+        if(rank == 0)
+        {
+            fprintf(stderr, "[OFI] CXI PALS auth key unavailable: %s\n",
+                    selection.error.empty() ? "unknown PALS error" : selection.error.c_str());
+        }
+        return;
+    }
+
+    auto *auth_key = static_cast<cxi_auth_key*>(std::malloc(sizeof(cxi_auth_key)));
+    if(not auth_key)
+    {
+        ThrowOFIError("malloc failed for CXI auth key");
+    }
+    *auth_key = selection.key;
+
+    info->domain_attr->auth_key = reinterpret_cast<uint8_t*>(auth_key);
+    info->domain_attr->auth_key_size = sizeof(cxi_auth_key);
+
+    if(rank == 0)
+    {
+        fprintf(stderr, "[OFI] CXI auth key from PALS: device=%s svc_id=%u vni=%u profiles=%d\n",
+                selection.device_name.c_str(),
+                static_cast<unsigned>(selection.key.svc_id),
+                static_cast<unsigned>(selection.key.vni),
+                selection.profile_count);
+    }
+#else
+    if(rank == 0)
+    {
+        fprintf(stderr, "[OFI] CXI PALS auth-key support is not compiled in; "
+                "relying on libfabric environment/default service discovery\n");
+    }
+#endif
+}
+
 static bool IsHardwareRDMAProvider(const std::string &provider)
 {
     const std::string base = ProviderBase(provider);
@@ -158,6 +342,155 @@ static int HardwareProviderScore(const std::string &provider)
     return -1;
 }
 
+static std::vector<std::string> DefaultRDMProviderOrder()
+{
+    return {"cxi", "efa", "psm3", "psm2", "opx", "gni", "mlx", "verbs"};
+}
+
+static std::vector<std::string> SplitProviderList(const char *providers)
+{
+    std::vector<std::string> result;
+    if(not providers)
+    {
+        return result;
+    }
+
+    std::string value = providers;
+    bool exclude_list = false;
+    if(not value.empty() and value[0] == '^')
+    {
+        exclude_list = true;
+        value.erase(value.begin());
+    }
+
+    size_t pos = 0;
+    while(pos <= value.size())
+    {
+        size_t comma = value.find(',', pos);
+        std::string token = value.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if(not token.empty())
+        {
+            result.push_back(Lowercase(token));
+        }
+        if(comma == std::string::npos)
+        {
+            break;
+        }
+        pos = comma + 1;
+    }
+
+    if(exclude_list)
+    {
+        std::vector<std::string> included = DefaultRDMProviderOrder();
+        included.erase(std::remove_if(included.begin(), included.end(),
+                                      [&](const std::string &provider) {
+                                          const std::string base = ProviderBase(Lowercase(provider));
+                                          return std::find_if(result.begin(), result.end(),
+                                                              [&](const std::string &excluded) {
+                                                                  return ProviderBase(excluded) == base;
+                                                              }) != result.end();
+                                      }),
+                       included.end());
+        return included;
+    }
+
+    return result;
+}
+
+static std::vector<std::string> RDMProviderProbeOrder(const std::string &provider_name,
+                                                       const std::string &exclude_family = "")
+{
+    if(not provider_name.empty())
+    {
+        return {provider_name};
+    }
+
+    const char *env_provider = std::getenv("FI_PROVIDER");
+    if(env_provider and env_provider[0] != '\0')
+    {
+        std::vector<std::string> providers = SplitProviderList(env_provider);
+        if(not exclude_family.empty())
+        {
+            providers.erase(std::remove_if(providers.begin(), providers.end(),
+                                           [&](const std::string &provider) {
+                                               return ProviderBase(Lowercase(provider)) == exclude_family;
+                                           }),
+                            providers.end());
+        }
+        return providers;
+    }
+
+    std::vector<std::string> providers = DefaultRDMProviderOrder();
+    if(not exclude_family.empty())
+    {
+        providers.erase(std::remove_if(providers.begin(), providers.end(),
+                                       [&](const std::string &provider) {
+                                           return ProviderBase(Lowercase(provider)) == exclude_family;
+                                       }),
+                        providers.end());
+    }
+    return providers;
+}
+
+static std::vector<std::string> MSGProviderProbeOrder(const std::string &provider_name)
+{
+    if(not provider_name.empty())
+    {
+        std::string msg_provider_name = provider_name;
+        if(IsInfiniBandVerbsProvider(Lowercase(msg_provider_name)))
+        {
+            msg_provider_name = "verbs";
+        }
+        return {msg_provider_name};
+    }
+
+    const char *env_provider = std::getenv("FI_PROVIDER");
+    if(env_provider and env_provider[0] != '\0')
+    {
+        std::vector<std::string> providers = SplitProviderList(env_provider);
+        providers.erase(std::remove_if(providers.begin(), providers.end(),
+                                       [](const std::string &provider) {
+                                           return not IsInfiniBandVerbsProvider(provider);
+                                       }),
+                        providers.end());
+        return providers;
+    }
+
+    return {"verbs"};
+}
+
+static fi_info *QueryOFIInfo(uint64_t caps, fi_ep_type ep_type, uint64_t mr_mode,
+                             const std::string &provider_name, int &ret)
+{
+    fi_info *hints = fi_allocinfo();
+    if(not hints)
+    {
+        ret = -FI_ENOMEM;
+        return nullptr;
+    }
+
+    hints->caps = caps;
+    hints->ep_attr->type = ep_type;
+    if(mr_mode != 0)
+    {
+        hints->domain_attr->mr_mode = mr_mode;
+    }
+
+    if(not provider_name.empty())
+    {
+        hints->fabric_attr->prov_name = strdup(provider_name.c_str());
+    }
+
+    fi_info *info_list = nullptr;
+    ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, hints, &info_list);
+    fi_freeinfo(hints);
+    if(ret != 0)
+    {
+        return nullptr;
+    }
+    return info_list;
+}
+
 static fi_info *ChooseBestRDMProvider(fi_info *list, const std::string &exclude_family = "")
 {
     fi_info *best = nullptr;
@@ -165,8 +498,23 @@ static fi_info *ChooseBestRDMProvider(fi_info *list, const std::string &exclude_
 
     for(fi_info *cur = list; cur != nullptr; cur = cur->next)
     {
+        if(not cur->domain_attr or not cur->ep_attr)
+        {
+            continue;
+        }
+
         std::string pname = ProviderName(cur);
         std::string family = ProviderBase(pname);
+
+        if((cur->caps & (FI_RMA | FI_ATOMIC)) != (FI_RMA | FI_ATOMIC))
+        {
+            continue;
+        }
+
+        if(cur->ep_attr->type != FI_EP_RDM)
+        {
+            continue;
+        }
 
         if(not exclude_family.empty())
         {
@@ -181,6 +529,10 @@ static fi_info *ChooseBestRDMProvider(fi_info *list, const std::string &exclude_
         int score = HardwareProviderScore(pname);
 
         bool virt_addr = (cur->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0;
+        bool prov_key = (cur->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0;
+        bool endpoint = (cur->domain_attr->mr_mode & FI_MR_ENDPOINT) != 0;
+        if(prov_key) score += 20;
+        if(endpoint) score += 5;
         if(virt_addr) score += 10;
 
         if(score > best_score)
@@ -193,6 +545,37 @@ static fi_info *ChooseBestRDMProvider(fi_info *list, const std::string &exclude_
     return best;
 }
 
+static fi_info *FindBestRDMProviderInfo(const std::string &provider_name,
+                                        const std::string &exclude_family,
+                                        int &last_ret)
+{
+    last_ret = -FI_ENODATA;
+    for(const std::string &provider : RDMProviderProbeOrder(provider_name, exclude_family))
+    {
+        int ret = 0;
+        fi_info *info_list = QueryOFIInfo(FI_RMA | FI_ATOMIC,
+                                          FI_EP_RDM,
+                                          FI_MR_ALLOCATED | FI_MR_PROV_KEY |
+                                              FI_MR_ENDPOINT,
+                                          provider, ret);
+        if(ret != 0)
+        {
+            last_ret = ret;
+            continue;
+        }
+
+        fi_info *chosen = ChooseBestRDMProvider(info_list, exclude_family);
+        fi_info *result = chosen ? fi_dupinfo(chosen) : nullptr;
+        fi_freeinfo(info_list);
+        if(result)
+        {
+            last_ret = 0;
+            return result;
+        }
+    }
+    return nullptr;
+}
+
 static fi_info *ChooseMSGProvider(fi_info *list)
 {
     fi_info *best = nullptr;
@@ -200,12 +583,29 @@ static fi_info *ChooseMSGProvider(fi_info *list)
 
     for(fi_info *cur = list; cur != nullptr; cur = cur->next)
     {
+        if(not cur->domain_attr or not cur->ep_attr)
+        {
+            continue;
+        }
+
         std::string pname = ProviderName(cur);
         int score = 0;
         if(IsInfiniBandVerbsProvider(pname)) score = 100;
         else continue;
 
+        if((cur->caps & (FI_RMA | FI_ATOMIC)) != (FI_RMA | FI_ATOMIC))
+        {
+            continue;
+        }
+
+        if(cur->ep_attr->type != FI_EP_MSG)
+        {
+            continue;
+        }
+
         bool virt_addr = (cur->domain_attr->mr_mode & FI_MR_VIRT_ADDR) != 0;
+        bool prov_key = (cur->domain_attr->mr_mode & FI_MR_PROV_KEY) != 0;
+        if(prov_key) score += 20;
         if(virt_addr) score += 10;
 
         if(score > best_score)
@@ -216,6 +616,86 @@ static fi_info *ChooseMSGProvider(fi_info *list)
     }
 
     return best;
+}
+
+static fi_info *FindBestMSGProviderInfo(const std::string &provider_name, int &last_ret)
+{
+    last_ret = -FI_ENODATA;
+    for(const std::string &provider : MSGProviderProbeOrder(provider_name))
+    {
+        int ret = 0;
+        fi_info *info_list = QueryOFIInfo(FI_RMA | FI_ATOMIC,
+                                          FI_EP_MSG,
+                                          FI_MR_ALLOCATED | FI_MR_PROV_KEY,
+                                          provider, ret);
+        if(ret != 0)
+        {
+            last_ret = ret;
+            continue;
+        }
+
+        fi_info *chosen = ChooseMSGProvider(info_list);
+        fi_info *result = chosen ? fi_dupinfo(chosen) : nullptr;
+        fi_freeinfo(info_list);
+        if(result)
+        {
+            last_ret = 0;
+            return result;
+        }
+    }
+    return nullptr;
+}
+
+template<typename Lookup>
+static fi_info *RunSerializedOFILookup(MPI_Comm comm, int rank, int size,
+                                       const Lookup &lookup)
+{
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if(not mpi_initialized or comm == MPI_COMM_NULL or size <= 1)
+    {
+        return lookup();
+    }
+
+    fi_info *result = nullptr;
+    std::exception_ptr error;
+
+    for(int turn = 0; turn < size; ++turn)
+    {
+        if(rank == turn)
+        {
+            try
+            {
+                result = lookup();
+            }
+            catch(...)
+            {
+                error = std::current_exception();
+            }
+        }
+        MPI_Barrier(comm);
+    }
+
+    if(error)
+    {
+        std::rethrow_exception(error);
+    }
+    return result;
+}
+
+static bool AllRanksTrue(MPI_Comm comm, bool value)
+{
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if(not mpi_initialized or comm == MPI_COMM_NULL)
+    {
+        return value;
+    }
+
+    int local_value = value ? 1 : 0;
+    int global_value = 0;
+    MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN, comm);
+    return global_value != 0;
 }
 
 static std::string OFIProviderComponent(const std::string &provider)
@@ -234,67 +714,50 @@ static std::string OFIProviderComponent(const std::string &provider)
     return component;
 }
 
-bool OFIContext::HasUsableProvider(const std::string &provider_name)
+bool OFIContext::HasUsableProvider(const std::string &provider_name, MPI_Comm comm)
 {
-    fi_info *hints = fi_allocinfo();
-    if(not hints)
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    int rank = 0;
+    int size = 1;
+    if(mpi_initialized and comm != MPI_COMM_NULL)
     {
-        return false;
+        MPI_Comm_rank(comm, &rank);
+        MPI_Comm_size(comm, &size);
     }
 
-    hints->caps = FI_RMA | FI_ATOMIC;
-    hints->ep_attr->type = FI_EP_RDM;
-    hints->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
-                                  FI_MR_PROV_KEY | FI_MR_ENDPOINT;
-    if(not provider_name.empty())
+    int ret = 0;
+    fi_info *info = RunSerializedOFILookup(comm, rank, size, [&]() {
+        return FindBestRDMProviderInfo(provider_name, "", ret);
+    });
+    bool all_have_rdm = AllRanksTrue(comm, info != nullptr);
+    if(info and not all_have_rdm)
     {
-        hints->fabric_attr->prov_name = strdup(provider_name.c_str());
+        fi_freeinfo(info);
+        info = nullptr;
+    }
+    if(all_have_rdm)
+    {
+        fi_freeinfo(info);
+        return true;
     }
 
-    fi_info *info_list = nullptr;
-    int ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, hints, &info_list);
-    fi_freeinfo(hints);
-    if(ret == 0)
+    info = RunSerializedOFILookup(comm, rank, size, [&]() {
+        return FindBestMSGProviderInfo(provider_name, ret);
+    });
+    bool all_have_msg = AllRanksTrue(comm, info != nullptr);
+    if(info and not all_have_msg)
     {
-        bool has_provider = ChooseBestRDMProvider(info_list) != nullptr;
-        fi_freeinfo(info_list);
-        if(has_provider)
-        {
-            return true;
-        }
+        fi_freeinfo(info);
+        info = nullptr;
+    }
+    if(all_have_msg)
+    {
+        fi_freeinfo(info);
+        return true;
     }
 
-    fi_info *msg_hints = fi_allocinfo();
-    if(not msg_hints)
-    {
-        return false;
-    }
-
-    msg_hints->caps = FI_RMA | FI_ATOMIC;
-    msg_hints->ep_attr->type = FI_EP_MSG;
-    msg_hints->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-
-    std::string msg_provider_name = provider_name;
-    if(IsInfiniBandVerbsProvider(Lowercase(msg_provider_name)))
-    {
-        msg_provider_name = "verbs";
-    }
-    if(not msg_provider_name.empty())
-    {
-        msg_hints->fabric_attr->prov_name = strdup(msg_provider_name.c_str());
-    }
-
-    fi_info *msg_list = nullptr;
-    ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, msg_hints, &msg_list);
-    fi_freeinfo(msg_hints);
-    if(ret != 0)
-    {
-        return false;
-    }
-
-    bool has_msg_provider = ChooseMSGProvider(msg_list) != nullptr;
-    fi_freeinfo(msg_list);
-    return has_msg_provider;
+    return false;
 }
 
 fid_ep *OFIContext::CreateBoundEndpoint(fi_info *ep_info)
@@ -337,47 +800,25 @@ fid_ep *OFIContext::CreateBoundEndpoint(fi_info *ep_info)
 
 void OFIContext::SetupFabric(const std::string &provider_name)
 {
-    fi_info *hints = fi_allocinfo();
-    if(not hints)
+    int ret = 0;
+    this->fi = RunSerializedOFILookup(this->comm, this->rank, this->size, [&]() {
+        return FindBestRDMProviderInfo(provider_name, "", ret);
+    });
+    bool all_have_rdm = AllRanksTrue(this->comm, this->fi != nullptr);
+    if(this->fi and not all_have_rdm)
     {
-        ThrowOFIError("fi_allocinfo failed");
+        fi_freeinfo(this->fi);
+        this->fi = nullptr;
     }
-
-    hints->caps = FI_RMA | FI_ATOMIC;
-    hints->ep_attr->type = FI_EP_RDM;
-    hints->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
-                                  FI_MR_PROV_KEY | FI_MR_ENDPOINT;
-
-    if(not provider_name.empty())
+    if(this->fi)
     {
-        hints->fabric_attr->prov_name = strdup(provider_name.c_str());
-    }
-
-    fi_info *info_list = nullptr;
-    int ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, hints, &info_list);
-    fi_freeinfo(hints);
-
-    fi_info *chosen = nullptr;
-    if(ret == 0)
-    {
-        chosen = ChooseBestRDMProvider(info_list);
-    }
-
-    if(chosen)
-    {
-        this->fi = fi_dupinfo(chosen);
-        fi_freeinfo(info_list);
-        if(not this->fi)
-        {
-            ThrowOFIError("fi_dupinfo failed");
-        }
-
         ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
         if(ret != 0)
         {
             ThrowOFIError("fi_fabric failed", -ret);
         }
 
+        ConfigureCXIAuthKey(this->fi, this->rank);
         ret = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
         if(ret != 0)
         {
@@ -387,13 +828,15 @@ void OFIContext::SetupFabric(const std::string &provider_name)
             {
                 fprintf(stderr, "[OFI] provider %s: fi_domain failed (%s), retrying without it\n",
                         failed_provider.c_str(), fi_strerror(-ret));
-                const char *vnis = std::getenv("SLINGSHOT_VNIS");
-                if(not vnis or vnis[0] == '\0')
-                {
-                    fprintf(stderr, "[OFI] WARNING: SLINGSHOT_VNIS is not set. "
-                            "CXI requires it for authentication. Use srun instead of mpirun, "
-                            "or export SLINGSHOT_VNIS manually.\n");
-                }
+                fprintf(stderr, "[OFI] CXI domain creation requires a valid service/VNI "
+                        "authorization key. CXI may obtain it from SLINGSHOT_* "
+                        "environment variables, configured UID/GID services, an unrestricted "
+                        "service, or FI_CXI_DEFAULT_VNI; SLINGSHOT_VNIS being unset is not "
+                        "by itself an error.\n");
+                fprintf(stderr, "[OFI] STORM now tries libpals first. If the preceding "
+                        "PALS line says PALS_APINFO is unset, this process was not launched "
+                        "inside a PALS/Cray-Slurm job step that exposes CXI communication "
+                        "profiles.\n");
             }
             fi_close(&this->fabric->fid);
             this->fabric = nullptr;
@@ -402,35 +845,12 @@ void OFIContext::SetupFabric(const std::string &provider_name)
 
             std::string exclude_family = ProviderBase(Lowercase(failed_provider));
 
-            fi_info *hints2 = fi_allocinfo();
-            if(not hints2)
-                ThrowOFIError("fi_allocinfo failed (retry)");
-            hints2->caps = FI_RMA | FI_ATOMIC;
-            hints2->ep_attr->type = FI_EP_RDM;
-            hints2->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
-                                           FI_MR_PROV_KEY | FI_MR_ENDPOINT;
-
-            fi_info *info_list2 = nullptr;
-            ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, hints2, &info_list2);
-            fi_freeinfo(hints2);
-            if(ret != 0)
-            {
-                ThrowOFIError("fi_getinfo failed on retry", -ret);
-            }
-
-            fi_info *chosen2 = ChooseBestRDMProvider(info_list2, exclude_family);
-            if(not chosen2)
-            {
-                fi_freeinfo(info_list2);
-                ThrowOFIError("no fallback provider available after excluding " + exclude_family);
-            }
-
-            this->fi = fi_dupinfo(chosen2);
-            fi_freeinfo(info_list2);
-
+            this->fi = RunSerializedOFILookup(this->comm, this->rank, this->size, [&]() {
+                return FindBestRDMProviderInfo(provider_name, exclude_family, ret);
+            });
             if(not this->fi)
             {
-                ThrowOFIError("fi_dupinfo failed (retry)");
+                ThrowOFIError("no fallback provider available after excluding " + exclude_family);
             }
 
             ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
@@ -438,6 +858,7 @@ void OFIContext::SetupFabric(const std::string &provider_name)
             {
                 ThrowOFIError("fi_fabric failed (retry)", -ret);
             }
+            ConfigureCXIAuthKey(this->fi, this->rank);
             ret = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
             if(ret != 0)
             {
@@ -449,64 +870,18 @@ void OFIContext::SetupFabric(const std::string &provider_name)
     }
     else
     {
-        if(info_list)
+        this->fi = RunSerializedOFILookup(this->comm, this->rank, this->size, [&]() {
+            return FindBestMSGProviderInfo(provider_name, ret);
+        });
+        bool all_have_msg = AllRanksTrue(this->comm, this->fi != nullptr);
+        if(this->fi and not all_have_msg)
         {
-            fi_freeinfo(info_list);
+            fi_freeinfo(this->fi);
+            this->fi = nullptr;
         }
-
-        fi_info *msg_hints = fi_allocinfo();
-        if(not msg_hints)
+        if(not all_have_msg)
         {
-            ThrowOFIError("fi_allocinfo failed (MSG)");
-        }
-
-        msg_hints->caps = FI_RMA | FI_ATOMIC;
-        msg_hints->ep_attr->type = FI_EP_MSG;
-        msg_hints->domain_attr->mr_mode = FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-
-        std::string msg_provider_name = provider_name;
-        if(IsInfiniBandVerbsProvider(Lowercase(msg_provider_name)))
-        {
-            msg_provider_name = "verbs";
-        }
-
-        if(not msg_provider_name.empty())
-        {
-            msg_hints->fabric_attr->prov_name = strdup(msg_provider_name.c_str());
-        }
-
-        fi_info *msg_list = nullptr;
-        ret = fi_getinfo(FI_VERSION(1, 6), nullptr, nullptr, 0, msg_hints, &msg_list);
-
-        fi_freeinfo(msg_hints);
-        if(ret != 0)
-        {
-            ThrowOFIError("fi_getinfo failed: no hardware OFI RDM provider and no verbs MSG provider with RMA+atomic support", -ret);
-        }
-
-        fi_info *msg_chosen = ChooseMSGProvider(msg_list);
-        if(not msg_chosen)
-        {
-            if(this->rank == 0)
-            {
-                fprintf(stderr, "[OFI] MSG providers returned by fi_getinfo:\n");
-                for(fi_info *cur = msg_list; cur; cur = cur->next)
-                {
-                    fprintf(stderr, "[OFI]   provider: %s, ep_type: %d\n",
-                            cur->fabric_attr->prov_name ? cur->fabric_attr->prov_name : "(null)",
-                            cur->ep_attr->type);
-                }
-            }
-            fi_freeinfo(msg_list);
             ThrowOFIError("no suitable hardware OFI provider found (need cxi/efa/psm/gni/opx/mlx RDM or verbs MSG; refusing tcp/sockets)");
-        }
-
-        this->fi = fi_dupinfo(msg_chosen);
-        fi_freeinfo(msg_list);
-
-        if(not this->fi)
-        {
-            ThrowOFIError("fi_dupinfo failed (MSG)");
         }
 
         ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
