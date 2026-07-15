@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <exception>
+#include <climits>
 #include <sys/uio.h>
 
 #if defined(__WITH_PALS) && __has_include(<pals.h>) && __has_include(<rdma/fi_cxi_ext.h>)
@@ -99,7 +100,40 @@ OFIContext::OFIContext(MPI_Comm comm, const std::string &provider_name)
         fprintf(stderr, "[OFI] initializing shared context on %d ranks\n", this->size);
     }
 
-    this->SetupFabric(provider_name);
+    std::exception_ptr setup_error;
+    try
+    {
+        this->SetupFabric(provider_name);
+    }
+    catch(...)
+    {
+        setup_error = std::current_exception();
+    }
+
+    int local_setup_success = setup_error ? 0 : 1;
+    int all_setup_success = 0;
+    MPI_Allreduce(&local_setup_success, &all_setup_success, 1, MPI_INT, MPI_MIN, this->comm);
+    if(not all_setup_success)
+    {
+        if(setup_error)
+        {
+            try
+            {
+                std::rethrow_exception(setup_error);
+            }
+            catch(const std::exception &e)
+            {
+                fprintf(stderr, "[OFI rank %d] fabric setup failed: %s\n",
+                        this->rank, e.what());
+            }
+            catch(...)
+            {
+            }
+        }
+        this->Free();
+        throw std::runtime_error("OFIContext: fabric setup failed on at least one rank");
+    }
+
     if(this->connected_mode)
     {
         this->EstablishConnections();
@@ -646,41 +680,99 @@ static fi_info *FindBestMSGProviderInfo(const std::string &provider_name, int &l
     return nullptr;
 }
 
-template<typename Lookup>
-static fi_info *RunSerializedOFILookup(MPI_Comm comm, int rank, int size,
-                                       const Lookup &lookup)
+// CXI discovery and domain creation can contend among processes sharing a NIC.
+// Serialize only within each node; world-rank serialization makes startup O(P).
+template<typename Call>
+static auto RunNodeSerializedOFICall(MPI_Comm comm, const Call &call) -> decltype(call())
 {
     int mpi_initialized = 0;
     MPI_Initialized(&mpi_initialized);
-    if(not mpi_initialized or comm == MPI_COMM_NULL or size <= 1)
+    if(not mpi_initialized or comm == MPI_COMM_NULL)
     {
-        return lookup();
+        return call();
     }
 
-    fi_info *result = nullptr;
+    int comm_size = 1;
+    MPI_Comm_size(comm, &comm_size);
+    if(comm_size <= 1)
+    {
+        return call();
+    }
+
+#if MPI_VERSION < 3
+    return call();
+#else
+    using Result = decltype(call());
+    MPI_Comm node_comm = MPI_COMM_NULL;
+    int mpi_ret = MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0,
+                                      MPI_INFO_NULL, &node_comm);
+    int local_split_success =
+        (mpi_ret == MPI_SUCCESS and node_comm != MPI_COMM_NULL) ? 1 : 0;
+    int all_split_success = 0;
+    MPI_Allreduce(&local_split_success, &all_split_success, 1, MPI_INT, MPI_MIN, comm);
+    if(not all_split_success)
+    {
+        if(node_comm != MPI_COMM_NULL)
+        {
+            MPI_Comm_free(&node_comm);
+        }
+        throw std::runtime_error(
+            "OFIContext: MPI_Comm_split_type failed during serialized OFI setup");
+    }
+
+    int node_rank = 0;
+    int node_size = 1;
+    MPI_Comm_rank(node_comm, &node_rank);
+    MPI_Comm_size(node_comm, &node_size);
+
+    Result result{};
     std::exception_ptr error;
 
-    for(int turn = 0; turn < size; ++turn)
+    for(int turn = 0; turn < node_size; ++turn)
     {
-        if(rank == turn)
+        if(node_rank == turn)
         {
             try
             {
-                result = lookup();
+                result = call();
             }
             catch(...)
             {
                 error = std::current_exception();
             }
         }
-        MPI_Barrier(comm);
+        MPI_Barrier(node_comm);
     }
 
-    if(error)
+    MPI_Comm_free(&node_comm);
+
+    int local_exception = error ? 1 : 0;
+    int any_exception = 0;
+    MPI_Allreduce(&local_exception, &any_exception, 1, MPI_INT, MPI_MAX, comm);
+    if(any_exception)
     {
-        std::rethrow_exception(error);
+        if(error)
+        {
+            try
+            {
+                std::rethrow_exception(error);
+            }
+            catch(const std::exception &e)
+            {
+                int rank = 0;
+                MPI_Comm_rank(comm, &rank);
+                fprintf(stderr, "[OFI rank %d] serialized setup call failed: %s\n",
+                        rank, e.what());
+            }
+            catch(...)
+            {
+            }
+        }
+        throw std::runtime_error(
+            "OFIContext: serialized OFI setup failed on at least one rank");
     }
     return result;
+#endif
 }
 
 static bool AllRanksTrue(MPI_Comm comm, bool value)
@@ -696,6 +788,38 @@ static bool AllRanksTrue(MPI_Comm comm, bool value)
     int global_value = 0;
     MPI_Allreduce(&local_value, &global_value, 1, MPI_INT, MPI_MIN, comm);
     return global_value != 0;
+}
+
+struct CollectiveOFIStatus
+{
+    bool success;
+    int error;
+    int rank;
+};
+
+static CollectiveOFIStatus GetCollectiveOFIStatus(MPI_Comm comm, int local_error)
+{
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if(not mpi_initialized or comm == MPI_COMM_NULL)
+    {
+        return {local_error == 0, local_error, local_error == 0 ? -1 : 0};
+    }
+
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+
+    int local_failed_rank = local_error == 0 ? INT_MAX : rank;
+    int first_failed_rank = INT_MAX;
+    MPI_Allreduce(&local_failed_rank, &first_failed_rank, 1, MPI_INT, MPI_MIN, comm);
+    if(first_failed_rank == INT_MAX)
+    {
+        return {true, 0, -1};
+    }
+
+    int first_error = rank == first_failed_rank ? local_error : 0;
+    MPI_Bcast(&first_error, 1, MPI_INT, first_failed_rank, comm);
+    return {false, first_error, first_failed_rank};
 }
 
 static std::string OFIProviderComponent(const std::string &provider)
@@ -716,18 +840,8 @@ static std::string OFIProviderComponent(const std::string &provider)
 
 bool OFIContext::HasUsableProvider(const std::string &provider_name, MPI_Comm comm)
 {
-    int mpi_initialized = 0;
-    MPI_Initialized(&mpi_initialized);
-    int rank = 0;
-    int size = 1;
-    if(mpi_initialized and comm != MPI_COMM_NULL)
-    {
-        MPI_Comm_rank(comm, &rank);
-        MPI_Comm_size(comm, &size);
-    }
-
     int ret = 0;
-    fi_info *info = RunSerializedOFILookup(comm, rank, size, [&]() {
+    fi_info *info = RunNodeSerializedOFICall(comm, [&]() {
         return FindBestRDMProviderInfo(provider_name, "", ret);
     });
     bool all_have_rdm = AllRanksTrue(comm, info != nullptr);
@@ -742,7 +856,7 @@ bool OFIContext::HasUsableProvider(const std::string &provider_name, MPI_Comm co
         return true;
     }
 
-    info = RunSerializedOFILookup(comm, rank, size, [&]() {
+    info = RunNodeSerializedOFICall(comm, [&]() {
         return FindBestMSGProviderInfo(provider_name, ret);
     });
     bool all_have_msg = AllRanksTrue(comm, info != nullptr);
@@ -800,8 +914,55 @@ fid_ep *OFIContext::CreateBoundEndpoint(fi_info *ep_info)
 
 void OFIContext::SetupFabric(const std::string &provider_name)
 {
+    auto closeFabricDomain = [this]()
+    {
+        if(this->domain)
+        {
+            fi_close(&this->domain->fid);
+            this->domain = nullptr;
+        }
+        if(this->fabric)
+        {
+            fi_close(&this->fabric->fid);
+            this->fabric = nullptr;
+        }
+    };
+
+    auto openFabricDomain = [this, &closeFabricDomain]()
+    {
+        int local_error = RunNodeSerializedOFICall(this->comm, [this]()
+        {
+            int error = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
+            if(error == 0)
+            {
+                try
+                {
+                    ConfigureCXIAuthKey(this->fi, this->rank);
+                }
+                catch(const std::exception &e)
+                {
+                    fprintf(stderr, "[OFI rank %d] provider authorization setup failed: %s\n",
+                            this->rank, e.what());
+                    error = -FI_EOTHER;
+                }
+            }
+            if(error == 0)
+            {
+                error = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
+            }
+            return error;
+        });
+
+        CollectiveOFIStatus status = GetCollectiveOFIStatus(this->comm, local_error);
+        if(not status.success)
+        {
+            closeFabricDomain();
+        }
+        return status;
+    };
+
     int ret = 0;
-    this->fi = RunSerializedOFILookup(this->comm, this->rank, this->size, [&]() {
+    this->fi = RunNodeSerializedOFICall(this->comm, [&]() {
         return FindBestRDMProviderInfo(provider_name, "", ret);
     });
     bool all_have_rdm = AllRanksTrue(this->comm, this->fi != nullptr);
@@ -810,59 +971,60 @@ void OFIContext::SetupFabric(const std::string &provider_name)
         fi_freeinfo(this->fi);
         this->fi = nullptr;
     }
-    if(this->fi)
+    if(all_have_rdm)
     {
-        ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
-        if(ret != 0)
+        std::string failed_provider = this->fi->fabric_attr->prov_name ?
+            this->fi->fabric_attr->prov_name : "";
+        std::string exclude_family = ProviderBase(Lowercase(failed_provider));
+        CollectiveOFIStatus status = openFabricDomain();
+        if(not status.success)
         {
-            ThrowOFIError("fi_fabric failed", -ret);
-        }
-
-        ConfigureCXIAuthKey(this->fi, this->rank);
-        ret = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
-        if(ret != 0)
-        {
-            std::string failed_provider = this->fi->fabric_attr->prov_name ?
-                this->fi->fabric_attr->prov_name : "";
             if(this->rank == 0)
             {
-                fprintf(stderr, "[OFI] provider %s: fi_domain failed (%s), retrying without it\n",
-                        failed_provider.c_str(), fi_strerror(-ret));
-                fprintf(stderr, "[OFI] CXI domain creation requires a valid service/VNI "
-                        "authorization key. CXI may obtain it from SLINGSHOT_* "
-                        "environment variables, configured UID/GID services, an unrestricted "
-                        "service, or FI_CXI_DEFAULT_VNI; SLINGSHOT_VNIS being unset is not "
-                        "by itself an error.\n");
-                fprintf(stderr, "[OFI] STORM now tries libpals first. If the preceding "
-                        "PALS line says PALS_APINFO is unset, this process was not launched "
-                        "inside a PALS/Cray-Slurm job step that exposes CXI communication "
-                        "profiles.\n");
+                fprintf(stderr,
+                        "[OFI] provider %s: fabric/domain setup failed on rank %d (%s), "
+                        "retrying without it\n",
+                        failed_provider.c_str(), status.rank,
+                        status.error == 0 ? "unknown error" : fi_strerror(-status.error));
+                if(exclude_family == "cxi")
+                {
+                    fprintf(stderr, "[OFI] CXI domain creation requires a valid service/VNI "
+                            "authorization key. CXI may obtain it from SLINGSHOT_* "
+                            "environment variables, configured UID/GID services, an unrestricted "
+                            "service, or FI_CXI_DEFAULT_VNI; SLINGSHOT_VNIS being unset is not "
+                            "by itself an error.\n");
+                    fprintf(stderr, "[OFI] EasyRMA tries libpals first. If the preceding "
+                            "PALS line says PALS_APINFO is unset, this process was not launched "
+                            "inside a PALS/Cray-Slurm job step that exposes CXI communication "
+                            "profiles.\n");
+                }
             }
-            fi_close(&this->fabric->fid);
-            this->fabric = nullptr;
+
             fi_freeinfo(this->fi);
             this->fi = nullptr;
 
-            std::string exclude_family = ProviderBase(Lowercase(failed_provider));
-
-            this->fi = RunSerializedOFILookup(this->comm, this->rank, this->size, [&]() {
+            this->fi = RunNodeSerializedOFICall(this->comm, [&]() {
                 return FindBestRDMProviderInfo(provider_name, exclude_family, ret);
             });
-            if(not this->fi)
+            bool all_have_fallback = AllRanksTrue(this->comm, this->fi != nullptr);
+            if(this->fi and not all_have_fallback)
+            {
+                fi_freeinfo(this->fi);
+                this->fi = nullptr;
+            }
+            if(not all_have_fallback)
             {
                 ThrowOFIError("no fallback provider available after excluding " + exclude_family);
             }
 
-            ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
-            if(ret != 0)
+            status = openFabricDomain();
+            if(not status.success)
             {
-                ThrowOFIError("fi_fabric failed (retry)", -ret);
-            }
-            ConfigureCXIAuthKey(this->fi, this->rank);
-            ret = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
-            if(ret != 0)
-            {
-                ThrowOFIError("fi_domain failed (retry)", -ret);
+                fi_freeinfo(this->fi);
+                this->fi = nullptr;
+                ThrowOFIError(
+                    "fallback fabric/domain setup failed on rank " + std::to_string(status.rank),
+                    status.error == 0 ? 0 : -status.error);
             }
         }
 
@@ -870,7 +1032,7 @@ void OFIContext::SetupFabric(const std::string &provider_name)
     }
     else
     {
-        this->fi = RunSerializedOFILookup(this->comm, this->rank, this->size, [&]() {
+        this->fi = RunNodeSerializedOFICall(this->comm, [&]() {
             return FindBestMSGProviderInfo(provider_name, ret);
         });
         bool all_have_msg = AllRanksTrue(this->comm, this->fi != nullptr);
@@ -884,16 +1046,14 @@ void OFIContext::SetupFabric(const std::string &provider_name)
             ThrowOFIError("no suitable hardware OFI provider found (need cxi/efa/psm/gni/opx/mlx RDM or verbs MSG; refusing tcp/sockets)");
         }
 
-        ret = fi_fabric(this->fi->fabric_attr, &this->fabric, nullptr);
-        if(ret != 0)
+        CollectiveOFIStatus status = openFabricDomain();
+        if(not status.success)
         {
-            ThrowOFIError("fi_fabric failed (MSG)", -ret);
-        }
-
-        ret = fi_domain(this->fabric, this->fi, &this->domain, nullptr);
-        if(ret != 0)
-        {
-            ThrowOFIError("fi_domain failed (MSG)", -ret);
+            fi_freeinfo(this->fi);
+            this->fi = nullptr;
+            ThrowOFIError(
+                "MSG fabric/domain setup failed on rank " + std::to_string(status.rank),
+                status.error == 0 ? 0 : -status.error);
         }
 
         this->connected_mode = true;
@@ -1004,13 +1164,32 @@ void OFIContext::SetupFabric(const std::string &provider_name)
 void OFIContext::ExchangeAddresses()
 {
     size_t addrlen = 0;
-    fi_getname(&this->ep->fid, nullptr, &addrlen);
+    int ret = fi_getname(&this->ep->fid, nullptr, &addrlen);
+    int local_error = (ret == 0 or ret == -FI_ETOOSMALL) ? 0 : ret;
+    CollectiveOFIStatus status = GetCollectiveOFIStatus(this->comm, local_error);
+    if(not status.success)
+    {
+        ThrowOFIError("fi_getname(size) failed on rank " + std::to_string(status.rank),
+                      status.error == 0 ? 0 : -status.error);
+    }
+
+    unsigned long long local_addrlen = static_cast<unsigned long long>(addrlen);
+    unsigned long long min_addrlen = 0;
+    unsigned long long max_addrlen = 0;
+    MPI_Allreduce(&local_addrlen, &min_addrlen, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, this->comm);
+    MPI_Allreduce(&local_addrlen, &max_addrlen, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, this->comm);
+    if(min_addrlen != max_addrlen or max_addrlen > static_cast<unsigned long long>(INT_MAX))
+    {
+        throw std::runtime_error("OFIContext: endpoint address lengths differ across ranks");
+    }
 
     std::vector<char> local_addr(addrlen);
-    int ret = fi_getname(&this->ep->fid, local_addr.data(), &addrlen);
-    if(ret != 0)
+    ret = fi_getname(&this->ep->fid, local_addr.data(), &addrlen);
+    status = GetCollectiveOFIStatus(this->comm, ret);
+    if(not status.success)
     {
-        ThrowOFIError("fi_getname failed", -ret);
+        ThrowOFIError("fi_getname failed on rank " + std::to_string(status.rank),
+                      status.error == 0 ? 0 : -status.error);
     }
 
     std::vector<char> all_addrs(this->size * addrlen);
@@ -1020,10 +1199,12 @@ void OFIContext::ExchangeAddresses()
     this->peer_addrs.resize(this->size);
     int inserted = fi_av_insert(this->av, all_addrs.data(), this->size,
                                 this->peer_addrs.data(), 0, nullptr);
-    if(inserted != this->size)
+    local_error = inserted == this->size ? 0 : (inserted < 0 ? inserted : -FI_EOTHER);
+    status = GetCollectiveOFIStatus(this->comm, local_error);
+    if(not status.success)
     {
-        ThrowOFIError("fi_av_insert failed: inserted " + std::to_string(inserted) +
-                      " of " + std::to_string(this->size) + " addresses");
+        ThrowOFIError("fi_av_insert failed on rank " + std::to_string(status.rank),
+                      status.error == 0 ? 0 : -status.error);
     }
 
     this->peer_connected.assign(this->size, true);

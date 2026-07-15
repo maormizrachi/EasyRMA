@@ -961,13 +961,14 @@ private:
 
     void BuildRankMap()
     {
-        int world_rank;
-        MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+        int context_rank;
+        MPI_Comm_rank(this->context.GetComm(), &context_rank);
         int agent_size;
         MPI_Comm_size(this->agent_comm, &agent_size);
         MPI_Comm_rank(this->agent_comm, &this->my_agent_rank);
         this->rank_map.resize(agent_size);
-        MPI_Allgather(&world_rank, 1, MPI_INT, this->rank_map.data(), 1, MPI_INT, this->agent_comm);
+        MPI_Allgather(&context_rank, 1, MPI_INT,
+                      this->rank_map.data(), 1, MPI_INT, this->agent_comm);
     }
 
     bool IsInBuffer(const T *ptr, size_t n) const

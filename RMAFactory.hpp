@@ -14,6 +14,9 @@
 
 #include <memory>
 #include <stdexcept>
+#include <exception>
+#include <cstdio>
+#include <utility>
 
 enum class RDMA_Type
 {
@@ -96,9 +99,60 @@ public:
                 {
                     throw std::runtime_error("RMAFactory::Initialize: OFI context is initialized on only some ranks");
                 }
-                if(not ctx)
+                if(ctx)
                 {
-                    ctx = std::make_shared<OFIContext>(comm);
+                    int relation = MPI_UNEQUAL;
+                    MPI_Comm_compare(ctx->GetComm(), comm, &relation);
+                    int local_compatible =
+                        (relation == MPI_IDENT or relation == MPI_CONGRUENT) ? 1 : 0;
+                    int all_compatible = 0;
+                    MPI_Allreduce(&local_compatible, &all_compatible, 1, MPI_INT, MPI_MIN, comm);
+                    if(not all_compatible)
+                    {
+                        throw std::runtime_error(
+                            "RMAFactory::Initialize: existing OFI context uses a different communicator");
+                    }
+                }
+                else
+                {
+                    std::shared_ptr<OFIContext> new_ctx;
+                    std::exception_ptr init_error;
+                    try
+                    {
+                        new_ctx = std::make_shared<OFIContext>(comm);
+                    }
+                    catch(...)
+                    {
+                        init_error = std::current_exception();
+                    }
+
+                    int local_success = init_error ? 0 : 1;
+                    int all_success = 0;
+                    MPI_Allreduce(&local_success, &all_success, 1, MPI_INT, MPI_MIN, comm);
+                    if(not all_success)
+                    {
+                        new_ctx.reset();
+                        if(init_error)
+                        {
+                            try
+                            {
+                                std::rethrow_exception(init_error);
+                            }
+                            catch(const std::exception &e)
+                            {
+                                int rank = 0;
+                                MPI_Comm_rank(comm, &rank);
+                                fprintf(stderr, "[OFI rank %d] context initialization failed: %s\n",
+                                        rank, e.what());
+                            }
+                            catch(...)
+                            {
+                            }
+                        }
+                        throw std::runtime_error(
+                            "RMAFactory::Initialize: OFI context initialization failed on at least one rank");
+                    }
+                    ctx = std::move(new_ctx);
                 }
                 break;
             }
@@ -246,7 +300,9 @@ private:
         auto &ctx = GetSharedOFIContext();
         if(not ctx)
         {
-            ctx = std::make_shared<OFIContext>(MPI_COMM_WORLD);
+            throw std::runtime_error(
+                "RMAFactory::CreateOFI: call RMAFactory::Initialize(OFI_RDMA, comm) "
+                "collectively before creating OFI agents");
         }
         return OFIRemoteMemoryAgent<T>::Create(count, *ctx, agent_comm);
     }
@@ -257,7 +313,9 @@ private:
         auto &ctx = GetSharedOFIContext();
         if(not ctx)
         {
-            ctx = std::make_shared<OFIContext>(MPI_COMM_WORLD);
+            throw std::runtime_error(
+                "RMAFactory::CreateOFIOver: call RMAFactory::Initialize(OFI_RDMA, comm) "
+                "collectively before creating OFI agents");
         }
         return std::make_unique<OFIRemoteMemoryAgent<T>>(user_buffer, count, *ctx, agent_comm);
     }
