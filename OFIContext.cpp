@@ -349,11 +349,16 @@ static void ConfigureCXIAuthKey(fi_info *info, int rank)
 #endif
 }
 
+static bool IsLayeredProvider(const std::string &provider)
+{
+    return provider.find(';') != std::string::npos;
+}
+
 static bool IsHardwareRDMAProvider(const std::string &provider)
 {
     const std::string base = ProviderBase(provider);
-    return base == "cxi" or base == "verbs" or base == "efa" or
-           base == "psm2" or base == "psm3" or base == "gni" or
+    return base == "cxi" or base == "efa" or base == "psm2" or
+           base == "psm3" or base == "gni" or
            base == "opx" or base == "mlx";
 }
 
@@ -372,7 +377,6 @@ static int HardwareProviderScore(const std::string &provider)
     if(base == "opx") return 75;
     if(base == "gni") return 70;
     if(base == "mlx") return 65;
-    if(base == "verbs") return 60;
     return -1;
 }
 
@@ -540,6 +544,14 @@ static fi_info *ChooseBestRDMProvider(fi_info *list, const std::string &exclude_
         std::string pname = ProviderName(cur);
         std::string family = ProviderBase(pname);
 
+        // Utility providers such as verbs;ofi_rxd and verbs;ofi_rxm do not
+        // provide the native ordering and progress semantics required here.
+        // Native verbs is handled separately through FI_EP_MSG/RC.
+        if(IsLayeredProvider(pname) or family == "verbs")
+        {
+            continue;
+        }
+
         if((cur->caps & (FI_RMA | FI_ATOMIC)) != (FI_RMA | FI_ATOMIC))
         {
             continue;
@@ -624,7 +636,7 @@ static fi_info *ChooseMSGProvider(fi_info *list)
 
         std::string pname = ProviderName(cur);
         int score = 0;
-        if(IsInfiniBandVerbsProvider(pname)) score = 100;
+        if(pname == "verbs") score = 100;
         else continue;
 
         if((cur->caps & (FI_RMA | FI_ATOMIC)) != (FI_RMA | FI_ATOMIC))
