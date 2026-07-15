@@ -240,7 +240,6 @@ static CXIAuthKeySelection LoadCXIAuthKeyFromPALS(const fi_info *info)
     if(rc != PALS_OK)
     {
         selection.error = PALSErrorMessage(state, "pals_get_comm_profiles");
-        std::free(profiles);
         pals_fini(state);
         return selection;
     }
@@ -280,7 +279,9 @@ static CXIAuthKeySelection LoadCXIAuthKeyFromPALS(const fi_info *info)
         selection.available = true;
         selection.key.svc_id = chosen->svc_id;
         selection.key.vni = chosen->vnis[0];
-        selection.device_name = chosen->device_name;
+        selection.device_name.assign(
+            chosen->device_name,
+            strnlen(chosen->device_name, sizeof(chosen->device_name)));
     }
     else
     {
@@ -292,7 +293,8 @@ static CXIAuthKeySelection LoadCXIAuthKeyFromPALS(const fi_info *info)
         }
     }
 
-    std::free(profiles);
+    // pals_get_comm_profiles() returns PALS-managed data associated with
+    // the state. pals_fini() releases it; do not pass it to free().
     pals_fini(state);
     return selection;
 }
