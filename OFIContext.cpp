@@ -486,18 +486,24 @@ static std::vector<std::string> MSGProviderProbeOrder(const std::string &provide
     if(env_provider and env_provider[0] != '\0')
     {
         std::vector<std::string> providers = SplitProviderList(env_provider);
-        providers.erase(std::remove_if(providers.begin(), providers.end(),
-                                       [](const std::string &provider) {
-                                           return not IsInfiniBandVerbsProvider(provider);
-                                       }),
-                        providers.end());
-        return providers;
+        for(const std::string &provider : providers)
+        {
+            if(IsInfiniBandVerbsProvider(provider))
+            {
+                // A positive core-provider filter such as "verbs" may expose
+                // layered providers as well. Always issue the MSG query against
+                // the exact native provider name.
+                return {"verbs"};
+            }
+        }
+        return {};
     }
 
     return {"verbs"};
 }
 
-static fi_info *QueryOFIInfo(uint64_t caps, fi_ep_type ep_type, uint64_t mr_mode,
+static fi_info *QueryOFIInfo(uint64_t caps, fi_ep_type ep_type,
+                             uint64_t mode, uint64_t mr_mode,
                              const std::string &provider_name, int &ret)
 {
     fi_info *hints = fi_allocinfo();
@@ -508,6 +514,7 @@ static fi_info *QueryOFIInfo(uint64_t caps, fi_ep_type ep_type, uint64_t mr_mode
     }
 
     hints->caps = caps;
+    hints->mode = mode;
     hints->ep_attr->type = ep_type;
     if(mr_mode != 0)
     {
@@ -527,6 +534,32 @@ static fi_info *QueryOFIInfo(uint64_t caps, fi_ep_type ep_type, uint64_t mr_mode
         return nullptr;
     }
     return info_list;
+}
+
+static void ReportProviderQueryFailure(int rank, const char *query_name,
+                                       const std::string &provider_name, int ret)
+{
+    const char *env_provider = std::getenv("FI_PROVIDER");
+    const char *filter = (env_provider and env_provider[0] != '\0') ?
+        env_provider : "<unset>";
+    const char *requested = provider_name.empty() ?
+        "<auto>" : provider_name.c_str();
+
+    if(ret != 0)
+    {
+        fprintf(stderr,
+                "[OFI rank %d] %s discovery failed: requested=%s "
+                "FI_PROVIDER=%s fi_getinfo=%d (%s)\n",
+                rank, query_name, requested, filter, ret, fi_strerror(-ret));
+    }
+    else
+    {
+        fprintf(stderr,
+                "[OFI rank %d] %s discovery returned interfaces, but none "
+                "matched the required exact native provider; requested=%s "
+                "FI_PROVIDER=%s\n",
+                rank, query_name, requested, filter);
+    }
 }
 
 static fi_info *ChooseBestRDMProvider(fi_info *list, const std::string &exclude_family = "")
@@ -601,6 +634,7 @@ static fi_info *FindBestRDMProviderInfo(const std::string &provider_name,
         int ret = 0;
         fi_info *info_list = QueryOFIInfo(FI_RMA | FI_ATOMIC,
                                           FI_EP_RDM,
+                                          0,
                                           FI_MR_ALLOCATED | FI_MR_PROV_KEY |
                                               FI_MR_ENDPOINT,
                                           provider, ret);
@@ -672,7 +706,9 @@ static fi_info *FindBestMSGProviderInfo(const std::string &provider_name, int &l
         int ret = 0;
         fi_info *info_list = QueryOFIInfo(FI_RMA | FI_ATOMIC,
                                           FI_EP_MSG,
-                                          FI_MR_ALLOCATED | FI_MR_PROV_KEY,
+                                          FI_RX_CQ_DATA,
+                                          FI_MR_LOCAL | FI_MR_VIRT_ADDR |
+                                              FI_MR_ALLOCATED | FI_MR_PROV_KEY,
                                           provider, ret);
         if(ret != 0)
         {
@@ -1047,7 +1083,13 @@ void OFIContext::SetupFabric(const std::string &provider_name)
         this->fi = RunNodeSerializedOFICall(this->comm, [&]() {
             return FindBestMSGProviderInfo(provider_name, ret);
         });
-        bool all_have_msg = AllRanksTrue(this->comm, this->fi != nullptr);
+        bool local_have_msg = this->fi != nullptr;
+        if(not local_have_msg)
+        {
+            ReportProviderQueryFailure(this->rank, "native verbs FI_EP_MSG",
+                                       provider_name, ret);
+        }
+        bool all_have_msg = AllRanksTrue(this->comm, local_have_msg);
         if(this->fi and not all_have_msg)
         {
             fi_freeinfo(this->fi);
