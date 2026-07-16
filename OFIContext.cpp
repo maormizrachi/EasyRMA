@@ -564,6 +564,10 @@ static void ReportProviderQueryFailure(int rank, const char *query_name,
     }
 }
 
+// RDM operations use FI_FENCE to order payload writes, atomics, and
+// quiescence reads. Require the capability when selecting the endpoint.
+static constexpr uint64_t RDM_REQUIRED_CAPS = FI_RMA | FI_ATOMIC | FI_FENCE;
+
 static fi_info *ChooseBestRDMProvider(fi_info *list, const std::string &exclude_family = "")
 {
     fi_info *best = nullptr;
@@ -587,7 +591,7 @@ static fi_info *ChooseBestRDMProvider(fi_info *list, const std::string &exclude_
             continue;
         }
 
-        if((cur->caps & (FI_RMA | FI_ATOMIC)) != (FI_RMA | FI_ATOMIC))
+        if((cur->caps & RDM_REQUIRED_CAPS) != RDM_REQUIRED_CAPS)
         {
             continue;
         }
@@ -634,7 +638,7 @@ static fi_info *FindBestRDMProviderInfo(const std::string &provider_name,
     for(const std::string &provider : RDMProviderProbeOrder(provider_name, exclude_family))
     {
         int ret = 0;
-        fi_info *info_list = QueryOFIInfo(FI_RMA | FI_ATOMIC,
+        fi_info *info_list = QueryOFIInfo(RDM_REQUIRED_CAPS,
                                           FI_EP_RDM,
                                           0,
                                           FI_MR_ALLOCATED | FI_MR_PROV_KEY |
@@ -1651,10 +1655,14 @@ void OFIContext::PostFencedRDMARead(int target_rank, void *local_addr, size_t by
     msg.rma_iov = &rma_iov;
     msg.rma_iov_count = 1;
 
+    // RDM endpoints require an explicit libfabric fence. Native verbs MSG
+    // endpoints are RC QPs and already order operations posted to the peer QP.
+    const uint64_t flags = FI_COMPLETION |
+                           (this->connected_mode ? uint64_t{0} : uint64_t{FI_FENCE});
     ssize_t ret;
     do
     {
-        ret = fi_readmsg(target_ep, &msg, FI_FENCE | FI_COMPLETION);
+        ret = fi_readmsg(target_ep, &msg, flags);
         if(ret == -FI_EAGAIN)
         {
             this->PollCompletions(1);
@@ -1711,13 +1719,15 @@ void OFIContext::PostAtomicCAS(int target_rank,
     msg.datatype = dtype;
     msg.op = FI_CSWAP;
 
+    const uint64_t flags = FI_COMPLETION |
+                           (this->connected_mode ? uint64_t{0} : uint64_t{FI_FENCE});
     ssize_t ret;
     do
     {
         ret = fi_compare_atomicmsg(target_ep, &msg,
                                     &compare_iov, compare_descs, 1,
                                     &result_iov, result_descs, 1,
-                                    FI_FENCE | FI_COMPLETION);
+                                    flags);
         if(ret == -FI_EAGAIN)
         {
             this->PollCompletions(1);
@@ -1768,12 +1778,14 @@ void OFIContext::PostAtomicFetchAdd(int target_rank,
     msg.datatype = dtype;
     msg.op = FI_SUM;
 
+    const uint64_t flags = FI_COMPLETION |
+                           (this->connected_mode ? uint64_t{0} : uint64_t{FI_FENCE});
     ssize_t ret;
     do
     {
         ret = fi_fetch_atomicmsg(target_ep, &msg,
                                   &result_iov, result_descs, 1,
-                                  FI_FENCE | FI_COMPLETION);
+                                  flags);
         if(ret == -FI_EAGAIN)
         {
             this->PollCompletions(1);
