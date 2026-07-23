@@ -31,10 +31,6 @@ class RMAFactory
 public:
     RMAFactory() = delete;
 
-    static void Initialize(RDMA_Type /*type*/, MPI_Comm /*comm*/) {}
-
-    static void MakeProgress(RDMA_Type /*type*/) {}
-
     static RDMA_Type ResolveAutoRDMA()
     {
 #ifdef __WITH_OFI
@@ -208,11 +204,10 @@ public:
             case RDMA_Type::MPI_RMA:
                 return MPIRemoteMemoryAgent<T>::CreateWithDefaultInfo(count, comm);
             case RDMA_Type::IBV_RDMA:
-            case RDMA_Type::OFI_RDMA:
 #ifdef __WITH_IBV
                 return CreateIBV<T>(count, comm);
 #else
-                throw std::runtime_error("RMAFactory: IBV/OFI RDMA selected but not enabled");
+                throw std::runtime_error("RMAFactory: IBV_RDMA selected but __WITH_IBV is not enabled");
 #endif
             case RDMA_Type::OFI_RDMA:
 #ifdef __WITH_OFI
@@ -244,11 +239,10 @@ public:
                 return agent;
             }
             case RDMA_Type::IBV_RDMA:
-            case RDMA_Type::OFI_RDMA:
 #ifdef __WITH_IBV
                 return CreateIBVOver<T>(user_buffer, count, comm);
 #else
-                throw std::runtime_error("RMAFactory: IBV/OFI RDMA selected but not enabled");
+                throw std::runtime_error("RMAFactory: IBV_RDMA selected but __WITH_IBV is not enabled");
 #endif
             case RDMA_Type::OFI_RDMA:
 #ifdef __WITH_OFI
