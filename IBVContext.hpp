@@ -87,6 +87,7 @@ private:
     int outstanding;
     int cq_size;
     uint32_t max_inline_data;
+    uint32_t maxMessageSize;
     bool freed;
 
     ibv_context *OpenDevice(const std::string &device_name);

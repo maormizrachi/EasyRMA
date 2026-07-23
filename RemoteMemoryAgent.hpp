@@ -156,6 +156,11 @@ public:
     // progress is manual.
     virtual void MakeProgress() {}
 
+    virtual bool SupportsAsyncReallocation() const { return false; }
+
+    virtual void QuiesceTarget(int /*target_rank*/) {}
+
+
     // Free the current buffer and allocate a fresh one of size new_count.
     // Unlike Resize, this does NOT copy old data — use only when contents are not needed.
     // This avoids peak memory = old + new that Resize incurs.

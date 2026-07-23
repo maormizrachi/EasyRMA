@@ -19,7 +19,7 @@ static void ThrowIBVError(const std::string &context, int err = 0)
 IBVContext::IBVContext(MPI_Comm comm, const std::string &device_name, uint8_t ib_port, int gid_index, int cq_size)
     : comm(comm), ctx(nullptr), pd(nullptr), cq(nullptr),
       ib_port(ib_port), gid_index(gid_index),
-      outstanding(0), cq_size(cq_size), max_inline_data(0), freed(false), is_roce(false)
+      outstanding(0), cq_size(cq_size), max_inline_data(0), maxMessageSize(0), freed(false), is_roce(false)
 {
     MPI_Comm_rank(this->comm, &this->rank);
     MPI_Comm_size(this->comm, &this->size);
@@ -31,6 +31,7 @@ IBVContext::IBVContext(MPI_Comm comm, const std::string &device_name, uint8_t ib
     {
         ThrowIBVError("ibv_query_port failed", errno);
     }
+    this->maxMessageSize = port_attr.max_msg_sz;
 
     this->lid = port_attr.lid;
     this->is_roce = (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET);
@@ -328,16 +329,22 @@ void IBVContext::EnsureCQSpace()
 
 void IBVContext::PostRDMAWrite(int target_rank, const void *local_addr, size_t bytes, uint32_t lkey, uint64_t remote_addr, uint32_t rkey, bool signaled)
 {
-    constexpr size_t MAX_RDMA_CHUNK = 1ULL << 30;
+    size_t maxChunkBytes = static_cast<size_t>(this->maxMessageSize);
+    if(maxChunkBytes == 0)
+    {
+        throw std::runtime_error("IBVContext::PostRDMAWrite: device reports a zero maximum message size");
+    }
 
-    const uint8_t *src = static_cast<const uint8_t*>(local_addr);
-    while(bytes > MAX_RDMA_CHUNK)
+    size_t offset = 0;
+    while(offset < bytes)
     {
         this->EnsureCQSpace();
+        size_t chunkBytes = std::min(bytes - offset, maxChunkBytes);
+        bool finalChunk = offset + chunkBytes == bytes;
 
         ibv_sge sge{};
-        sge.addr = reinterpret_cast<uint64_t>(src);
-        sge.length = static_cast<uint32_t>(MAX_RDMA_CHUNK);
+        sge.addr = reinterpret_cast<uint64_t>(local_addr) + offset;
+        sge.length = static_cast<uint32_t>(chunkBytes);
         sge.lkey = lkey;
 
         ibv_send_wr wr{};
@@ -345,38 +352,17 @@ void IBVContext::PostRDMAWrite(int target_rank, const void *local_addr, size_t b
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = remote_addr;
+        wr.send_flags = (signaled and finalChunk) ? IBV_SEND_SIGNALED : 0;
+        if(chunkBytes <= this->max_inline_data)
+        {
+            wr.send_flags |= IBV_SEND_INLINE;
+        }
+        wr.wr.rdma.remote_addr = remote_addr + offset;
         wr.wr.rdma.rkey = rkey;
 
         this->PostSend(this->qps[target_rank], wr);
-
-        src += MAX_RDMA_CHUNK;
-        remote_addr += MAX_RDMA_CHUNK;
-        bytes -= MAX_RDMA_CHUNK;
+        offset += chunkBytes;
     }
-
-    this->EnsureCQSpace();
-
-    ibv_sge sge{};
-    sge.addr = reinterpret_cast<uint64_t>(src);
-    sge.length = static_cast<uint32_t>(bytes);
-    sge.lkey = lkey;
-
-    ibv_send_wr wr{};
-    wr.wr_id = 0;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.opcode = IBV_WR_RDMA_WRITE;
-    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
-    if(bytes <= this->max_inline_data)
-    {
-        wr.send_flags |= IBV_SEND_INLINE;
-    }
-    wr.wr.rdma.remote_addr = remote_addr;
-    wr.wr.rdma.rkey = rkey;
-
-    this->PostSend(this->qps[target_rank], wr);
 }
 
 void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entries, size_t count, uint32_t lkey, uint32_t rkey, bool signaled)
