@@ -33,7 +33,9 @@ public:
 
     static RDMA_Type ResolveAutoRDMA()
     {
-#ifdef __WITH_OFI
+#ifdef __WITH_IBV
+        return RDMA_Type::IBV_RDMA;
+#elif defined(__WITH_OFI)
         return RDMA_Type::OFI_RDMA;
 #else
         return RDMA_Type::MPI_RMA;

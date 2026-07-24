@@ -124,7 +124,11 @@ public:
         this->context.PostRDMAWrite(world_target, local_addr, payload_bytes,
                                     local_desc, remote_addr, remote.key, signalWrite);
 
-        if(flush or temp_mr)
+        if(flush)
+        {
+            this->Flush(target_rank);
+        }
+        else if(temp_mr)
         {
             this->context.DrainCompletions();
             this->ResetStaging();
@@ -183,7 +187,11 @@ public:
                                         local_desc, remote_addr, remote.key, false);
         }
 
-        if(flush or temp_mr)
+        if(flush)
+        {
+            this->Flush(target_rank);
+        }
+        else if(temp_mr)
         {
             this->context.DrainCompletions();
             this->ResetStaging();
@@ -258,7 +266,11 @@ public:
                 entries[i].count * sizeof(T), local_desc, remote_addr, remote.key, false);
         }
 
-        if(flush or temp_mr)
+        if(flush)
+        {
+            this->Flush(target_rank);
+        }
+        else if(temp_mr)
         {
             this->context.DrainCompletions();
             this->ResetStaging();
@@ -272,6 +284,12 @@ public:
     typename RemoteMemoryAgent<T>::SourceRegistration RegisterExternalSource(const void *data, size_t bytes) override
     {
         if(bytes == 0) return {};
+        // Native RDM providers such as CXI have a constrained provider-key
+        // space. RankHandler may keep one source registration per peer, which
+        // can exhaust that space at Frontier scale. RDM writes already support
+        // bounded temporary registration or the shared staging MR, so reserve
+        // persistent source registrations for connected verbs/MSG endpoints.
+        if(not this->context.IsConnectedMode()) return {};
         fid_mr *ext_mr = this->context.RegisterMemory(const_cast<void*>(data), bytes,
             FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE);
         if(not ext_mr)
@@ -431,8 +449,8 @@ public:
 
         int world_target = this->rank_map[target_rank];
         const OFIRemoteRegion &remote = this->remote_regions[target_rank];
-        this->context.PostRDMARead(world_target, this->scratch, 1,
-                                   this->ScratchDesc(), remote.addr, remote.key, true);
+        this->context.PostFencedRDMARead(world_target, this->scratch, 1,
+                                         this->ScratchDesc(), remote.addr, remote.key);
         this->context.DrainCompletions();
         this->ResetStaging();
     }
@@ -455,7 +473,7 @@ public:
 
     bool SupportsAsyncReallocation() const override
     {
-        return this->SupportsLocalResize();
+        return not this->context.IsConnectedMode() and this->SupportsLocalResize();
     }
 
     void MakeProgress() override
