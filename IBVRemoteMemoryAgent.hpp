@@ -436,6 +436,11 @@ public:
         return this->SupportsLocalResize();
     }
 
+    bool SupportsPersistentSourceRegistration() const override
+    {
+        return true;
+    }
+
     void Resize(size_t new_count) override
     {
         if(not this->owns_memory)

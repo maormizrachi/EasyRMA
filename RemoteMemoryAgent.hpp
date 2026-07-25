@@ -121,6 +121,14 @@ public:
         return false;
     }
 
+    // Persistent source registration is independent of remote-buffer resize.
+    // Some transports can safely cache local MRs even when peer reallocation
+    // must remain synchronous.
+    virtual bool SupportsPersistentSourceRegistration() const
+    {
+        return false;
+    }
+
     virtual void SyncLocal()
     {
         std::atomic_thread_fence(std::memory_order_seq_cst);

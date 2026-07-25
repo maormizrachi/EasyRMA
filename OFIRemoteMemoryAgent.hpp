@@ -473,7 +473,20 @@ public:
 
     bool SupportsAsyncReallocation() const override
     {
-        return not this->context.IsConnectedMode() and this->SupportsLocalResize();
+        // Both connected MSG/verbs and native RDM providers use the same
+        // quiesce-before-resize protocol.  RankHandler holds the peer queue
+        // mutex, quiesces every old-region operation, and only then asks the
+        // peer to replace its MR and publish fresh metadata.
+        return this->SupportsLocalResize();
+    }
+
+    bool SupportsPersistentSourceRegistration() const override
+    {
+        // Connected MSG/verbs providers have a large MR key space and benefit
+        // substantially from caching send-buffer registrations.  Native RDM
+        // providers such as CXI deliberately use staging/temporary MRs to
+        // avoid exhausting their constrained provider-key space.
+        return this->context.IsConnectedMode();
     }
 
     void MakeProgress() override
