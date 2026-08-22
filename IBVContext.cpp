@@ -6,6 +6,29 @@
 #include <cassert>
 #include <algorithm>
 
+namespace
+{
+    enum IBVWorkRequestKind : uint8_t
+    {
+        WR_KIND_UNKNOWN = 0,
+        WR_KIND_RDMA_WRITE = 1,
+        WR_KIND_RDMA_WRITE_BATCH = 2,
+        WR_KIND_RDMA_READ = 3,
+        WR_KIND_ATOMIC_CAS = 4,
+        WR_KIND_ATOMIC_FETCH_ADD = 5
+    };
+
+    constexpr uint64_t WR_BYTES_MASK = 0x00ffffffULL;
+
+    uint64_t MakeWorkRequestID(IBVWorkRequestKind kind, uint32_t rkey, size_t bytes)
+    {
+        const uint64_t encodedBytes = std::min<uint64_t>(bytes, WR_BYTES_MASK);
+        return (static_cast<uint64_t>(rkey) << 32) |
+               (encodedBytes << 8) |
+               static_cast<uint64_t>(kind);
+    }
+}
+
 static void ThrowIBVError(const std::string &context, int err = 0)
 {
     std::string msg = "IBVContext: " + context;
@@ -348,7 +371,7 @@ void IBVContext::PostRDMAWrite(int target_rank, const void *local_addr, size_t b
         sge.lkey = lkey;
 
         ibv_send_wr wr{};
-        wr.wr_id = 0;
+        wr.wr_id = MakeWorkRequestID(WR_KIND_RDMA_WRITE, rkey, chunkBytes);
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.opcode = IBV_WR_RDMA_WRITE;
@@ -452,7 +475,7 @@ void IBVContext::PostRDMAWriteBatch(int target_rank, const RDMAWriteEntry *entri
             sges[i].lkey = lkey;
 
             wrs[i] = {};
-            wrs[i].wr_id = 0;
+            wrs[i].wr_id = MakeWorkRequestID(WR_KIND_RDMA_WRITE_BATCH, rkey, e.bytes);
             wrs[i].sg_list = &sges[i];
             wrs[i].num_sge = 1;
             wrs[i].opcode = IBV_WR_RDMA_WRITE;
@@ -499,7 +522,7 @@ void IBVContext::PostRDMARead(int target_rank, void *local_addr, size_t bytes, u
         sge.lkey = lkey;
 
         ibv_send_wr wr{};
-        wr.wr_id = 0;
+        wr.wr_id = MakeWorkRequestID(WR_KIND_RDMA_READ, rkey, bytes);
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.opcode = IBV_WR_RDMA_READ;
@@ -522,7 +545,7 @@ void IBVContext::PostRDMARead(int target_rank, void *local_addr, size_t bytes, u
     sge.lkey = lkey;
 
     ibv_send_wr wr{};
-    wr.wr_id = 0;
+    wr.wr_id = MakeWorkRequestID(WR_KIND_RDMA_READ, rkey, bytes);
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_READ;
@@ -543,7 +566,7 @@ void IBVContext::PostAtomicCAS(int target_rank, uint64_t *local_addr, uint32_t l
     sge.lkey = lkey;
 
     ibv_send_wr wr{};
-    wr.wr_id = 0;
+    wr.wr_id = MakeWorkRequestID(WR_KIND_ATOMIC_CAS, rkey, sizeof(uint64_t));
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_ATOMIC_CMP_AND_SWP;
@@ -566,7 +589,7 @@ void IBVContext::PostAtomicFetchAdd(int target_rank, uint64_t *local_addr, uint3
     sge.lkey = lkey;
 
     ibv_send_wr wr{};
-    wr.wr_id = 0;
+    wr.wr_id = MakeWorkRequestID(WR_KIND_ATOMIC_FETCH_ADD, rkey, sizeof(uint64_t));
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
@@ -592,7 +615,24 @@ int IBVContext::PollCompletions(int max)
     {
         if(wc[i].status != IBV_WC_SUCCESS)
         {
-            ThrowIBVError("work completion error: " + std::string(ibv_wc_status_str(wc[i].status)) + " (vendor_err=" + std::to_string(wc[i].vendor_err) + ")");
+            std::string extra;
+            std::unordered_map<uint32_t, int>::const_iterator qp_it = this->qpn_to_rank.find(wc[i].qp_num);
+            if(qp_it != this->qpn_to_rank.end())
+            {
+                extra = " target_rank=" + std::to_string(qp_it->second);
+            }
+            const uint64_t wr_id = wc[i].wr_id;
+            extra += " wc_opcode=" + std::to_string(static_cast<unsigned int>(wc[i].opcode));
+            extra += " wr_kind=" + std::to_string(static_cast<unsigned int>(wr_id & 0xffU));
+            const uint64_t postedBytes = (wr_id >> 8) & WR_BYTES_MASK;
+            extra += " posted_bytes=" + std::to_string(postedBytes);
+            if(postedBytes == WR_BYTES_MASK)
+            {
+                extra += "+";
+            }
+            extra += " posted_rkey=" + std::to_string(static_cast<uint32_t>(wr_id >> 32));
+            ThrowIBVError("work completion error: " + std::string(ibv_wc_status_str(wc[i].status)) +
+                          " (vendor_err=" + std::to_string(wc[i].vendor_err) + ")" + extra);
         }
 
         auto it = this->qpn_to_rank.find(wc[i].qp_num);

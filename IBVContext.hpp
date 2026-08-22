@@ -22,6 +22,7 @@ struct IBVConnectionInfo
 struct IBVRemoteRegion
 {
     uint64_t addr;
+    uint64_t count;
     uint32_t rkey;
 };
 

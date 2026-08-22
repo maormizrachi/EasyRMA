@@ -33,13 +33,28 @@ public:
 
     static RDMA_Type ResolveAutoRDMA()
     {
-#ifdef __WITH_IBV
-        return RDMA_Type::IBV_RDMA;
-#elif defined(__WITH_OFI)
+#ifdef __WITH_OFI
         return RDMA_Type::OFI_RDMA;
+#elif defined(__WITH_IBV)
+        return RDMA_Type::IBV_RDMA;
 #else
         return RDMA_Type::MPI_RMA;
 #endif
+    }
+
+    // Native verbs memory regions cannot grow in place: replacing one
+    // invalidates its rkey immediately. Dynamic queue payloads therefore use
+    // MPI RMA on IBV systems, whose collective window replacement supplies
+    // the required lifetime synchronization. Fixed-size control regions still
+    // use Create/CreateOver and remain native IBV. OFI (including CXI) is
+    // unchanged.
+    static RDMA_Type ResolveResizableRDMA(RDMA_Type type)
+    {
+        if(type == RDMA_Type::AUTO_RDMA)
+        {
+            type = ResolveAutoRDMA();
+        }
+        return type == RDMA_Type::IBV_RDMA ? RDMA_Type::MPI_RMA : type;
     }
 
     static bool IsBackendAvailable(RDMA_Type type, MPI_Comm comm)
@@ -221,6 +236,12 @@ public:
                 break;
         }
         throw std::runtime_error("RMAFactory: unknown RDMA type");
+    }
+
+    template<typename T>
+    static std::unique_ptr<RemoteMemoryAgent<T>> CreateResizable(RDMA_Type type, size_t count, MPI_Comm comm)
+    {
+        return Create<T>(ResolveResizableRDMA(type), count, comm);
     }
 
     template<typename T>

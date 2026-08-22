@@ -2,6 +2,7 @@
 
 #include "DistributedMutex.hpp"
 #include <cassert>
+#include <cstdint>
 
 DistributedMutex::DistributedMutex(const MPI_Comm &comm, rank_t rank, RDMA_Type rdma_type):
     comm(comm), rank(rank), destroyed(false)
@@ -12,7 +13,7 @@ DistributedMutex::DistributedMutex(const MPI_Comm &comm, rank_t rank, RDMA_Type 
     MPI_Comm_size(this->comm, &size);
     assert(size > 1);
 
-    this->agent = RMAFactory::Create<int>(rdma_type, 1, this->comm);
+    this->agent = RMAFactory::Create<uint64_t>(rdma_type, 1, this->comm);
 
     if(my_rank == rank and this->agent->GetLocalPointer() != nullptr)
     {
@@ -45,9 +46,9 @@ DistributedMutex::~DistributedMutex()
 
 void DistributedMutex::Lock(void)
 {
-    const int one = 1;
-    const int zero = 0;
-    int old = 0;
+    const uint64_t one = 1;
+    const uint64_t zero = 0;
+    uint64_t old = 0;
     int probe_flag;
 
     while(true)
@@ -64,9 +65,9 @@ void DistributedMutex::Lock(void)
 
 void DistributedMutex::Unlock(void)
 {
-    const int zero = 0;
-    const int one = 1;
-    int old;
+    const uint64_t zero = 0;
+    const uint64_t one = 1;
+    uint64_t old;
     this->agent->CompareAndSwap(zero, one, old, this->rank, 0);
 }
 

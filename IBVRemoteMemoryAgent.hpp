@@ -15,6 +15,7 @@
 #include <vector>
 #include <stdexcept>
 #include <memory>
+#include <utility>
 
 template<typename T>
 class IBVRemoteMemoryAgent : public RemoteMemoryAgent<T>
@@ -22,9 +23,9 @@ class IBVRemoteMemoryAgent : public RemoteMemoryAgent<T>
 public:
     IBVRemoteMemoryAgent(size_t count, IBVContext &context, MPI_Comm agent_comm)
         : count(count), context(context), agent_comm(agent_comm),
-          buffer(nullptr), mr(nullptr),
+          owned_buffer(), buffer(nullptr), mr(nullptr),
           scratch(nullptr), scratch_mr(nullptr),
-          staging(nullptr), staging_mr(nullptr), staging_size(0),
+          staging_storage(), staging(nullptr), staging_mr(nullptr), staging_size(0),
           staging_next(0), staging_active_target(-1),
           freed(false), owns_memory(true)
     {
@@ -36,9 +37,9 @@ public:
 
     IBVRemoteMemoryAgent(T *user_buffer, size_t count, IBVContext &context, MPI_Comm agent_comm)
         : count(count), context(context), agent_comm(agent_comm),
-          buffer(user_buffer), mr(nullptr),
+          owned_buffer(), buffer(user_buffer), mr(nullptr),
           scratch(nullptr), scratch_mr(nullptr),
-          staging(nullptr), staging_mr(nullptr), staging_size(0),
+          staging_storage(), staging(nullptr), staging_mr(nullptr), staging_size(0),
           staging_next(0), staging_active_target(-1),
           freed(false), owns_memory(false)
     {
@@ -71,12 +72,13 @@ public:
     {
         if(target_rank == this->my_agent_rank)
         {
-            std::memcpy(this->buffer + target_disp, origin, count * sizeof(T));
+            std::copy_n(origin, count, this->buffer + target_disp);
             return;
         }
 
         int world_target = this->rank_map[target_rank];
         const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+        this->ValidateRemoteRange(remote, target_rank, target_disp, count, "Put");
         uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
 
         size_t payload_bytes = count * sizeof(T);
@@ -110,7 +112,7 @@ public:
             else
             {
                 T *staged = this->AllocateStaging(count, world_target);
-                std::memcpy(staged, origin, payload_bytes);
+                std::copy_n(origin, count, staged);
                 local_addr = staged;
                 local_lkey = this->StagingLkey();
             }
@@ -171,7 +173,7 @@ public:
         else
         {
             T *staged = this->AllocateStaging(count, world_target);
-            std::memcpy(staged, contiguous_source, payload_bytes);
+            std::copy_n(contiguous_source, count, staged);
             local_source = staged;
             local_lkey = this->StagingLkey();
         }
@@ -179,6 +181,7 @@ public:
         entries.resize(count);
         for(size_t i = 0; i < count; i++)
         {
+            this->ValidateRemoteRange(remote, target_rank, target_disps[i], 1, "PutScatter");
             entries[i].local_addr = local_source + i;
             entries[i].bytes = static_cast<uint32_t>(sizeof(T));
             entries[i].remote_addr = remote.addr + target_disps[i] * sizeof(T);
@@ -210,9 +213,8 @@ public:
         {
             for(size_t i = 0; i < num_entries; i++)
             {
-                std::memcpy(this->buffer + entries[i].target_disp,
-                            source + entries[i].source_offset,
-                            entries[i].count * sizeof(T));
+                std::copy_n(source + entries[i].source_offset, entries[i].count,
+                            this->buffer + entries[i].target_disp);
             }
             return;
         }
@@ -257,7 +259,7 @@ public:
             else
             {
                 T *staged = this->AllocateStaging(total_elements, world_target);
-                std::memcpy(staged, source, payload_bytes);
+                std::copy_n(source, total_elements, staged);
                 local_source = staged;
                 local_lkey = this->StagingLkey();
             }
@@ -266,6 +268,8 @@ public:
         rdma_entries.resize(num_entries);
         for(size_t i = 0; i < num_entries; i++)
         {
+            this->ValidateRemoteRange(remote, target_rank, entries[i].target_disp,
+                                      entries[i].count, "PutBatch");
             rdma_entries[i].local_addr = local_source + entries[i].source_offset;
             rdma_entries[i].bytes = static_cast<uint32_t>(entries[i].count * sizeof(T));
             rdma_entries[i].remote_addr = remote.addr + entries[i].target_disp * sizeof(T);
@@ -308,12 +312,13 @@ public:
     {
         if(target_rank == this->my_agent_rank)
         {
-            std::memcpy(result, this->buffer + target_disp, count * sizeof(T));
+            std::copy_n(this->buffer + target_disp, count, result);
             return;
         }
 
         int world_target = this->rank_map[target_rank];
         const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+        this->ValidateRemoteRange(remote, target_rank, target_disp, count, "Get");
         uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
 
         bool external = not this->IsInBuffer(result, count);
@@ -333,7 +338,7 @@ public:
             this->context.DrainCompletions();
             if(external)
             {
-                std::memcpy(result, local_addr, count * sizeof(T));
+                std::copy_n(static_cast<T*>(local_addr), count, result);
             }
             this->ResetStaging();
         }
@@ -345,6 +350,7 @@ public:
         {
             int world_target = this->rank_map[target_rank];
             const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+            this->ValidateRemoteRange(remote, target_rank, target_disp, 1, "CompareAndSwap");
             uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
 
             uint64_t compare_val = 0, swap_val = 0;
@@ -379,6 +385,7 @@ public:
         {
             int world_target = this->rank_map[target_rank];
             const IBVRemoteRegion &remote = this->remote_regions[target_rank];
+            this->ValidateRemoteRange(remote, target_rank, target_disp, 1, "FetchAndAdd");
             uint64_t remote_addr = remote.addr + target_disp * sizeof(T);
 
             uint64_t add_val = 0;
@@ -433,12 +440,26 @@ public:
 
     bool SupportsAsyncReallocation() const override
     {
-        return this->SupportsLocalResize();
+        // Native verbs MRs become invalid immediately at ibv_dereg_mr. A
+        // requester that still has an old address/rkey cached can therefore
+        // turn an otherwise recoverable resize race into
+        // IBV_WC_REM_ACCESS_ERR. Use STORM's pair-synchronized resize path
+        // for IBV; LocalResize remains available as a primitive, but is not
+        // advertised as safe for background/asynchronous replacement.
+        return false;
     }
 
     bool SupportsPersistentSourceRegistration() const override
     {
         return true;
+    }
+
+    bool SupportsShrinkingReallocation() const override
+    {
+        // Keep verbs MRs monotonic. Repeated shrink/grow replacement churns
+        // address/rkey generations and has produced remote protection errors
+        // under CrookedPipe's highly imbalanced cycle-60 workload.
+        return false;
     }
 
     void Resize(size_t new_count) override
@@ -447,40 +468,39 @@ public:
         {
             throw std::runtime_error("IBVRemoteMemoryAgent::Resize: cannot resize user-supplied memory");
         }
-        this->context.DrainCompletions();
+        this->QuiesceAgentCommBeforeDeregister();
 
-        T *old_buffer = this->buffer;
         size_t old_count = this->count;
-
-        size_t new_alloc_size = new_count * sizeof(T);
-        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
-        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
-
-        T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
-        if(not new_buffer)
+        size_t copy_count = std::min(old_count, new_count);
+        std::vector<T> saved;
+        saved.reserve(copy_count);
+        for(size_t i = 0; i < copy_count; i++)
         {
-            throw std::runtime_error("IBVRemoteMemoryAgent::Resize: aligned_alloc failed");
+            saved.push_back(this->buffer[i]);
         }
-        std::memset(new_buffer, 0, new_aligned_size);
 
-        ibv_mr *new_mr = ibv_reg_mr(this->context.GetPD(), new_buffer, new_aligned_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        std::unique_ptr<T[]> new_storage =
+            std::make_unique<T[]>(std::max<size_t>(new_count, 1));
+        T *new_buffer = new_storage.get();
+        for(size_t i = 0; i < copy_count; i++)
+        {
+            new_buffer[i] = saved[i];
+        }
+
+        ibv_mr *new_mr = ibv_reg_mr(this->context.GetPD(), new_buffer,
+            std::max<size_t>(new_count, 1) * sizeof(T),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
         if(not new_mr)
         {
             throw std::runtime_error("IBVRemoteMemoryAgent::Resize: ibv_reg_mr failed");
-        }
-
-        size_t copy_count = std::min(old_count, new_count);
-        if(copy_count > 0)
-        {
-            std::memcpy(new_buffer, old_buffer, copy_count * sizeof(T));
         }
 
         if(this->mr)
         {
             ibv_dereg_mr(this->mr);
         }
-        rma_detail::advise_dontneed(old_buffer, old_count * sizeof(T));
-        std::free(old_buffer);
+        this->owned_buffer.reset();
 
         if(this->staging_mr)
         {
@@ -489,15 +509,15 @@ public:
         }
         if(this->staging)
         {
-            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
-            std::free(this->staging);
+            this->staging_storage.reset();
             this->staging = nullptr;
         }
         this->staging_size = 0;
         this->staging_next = 0;
         this->staging_active_target = -1;
 
-        this->buffer = new_buffer;
+        this->owned_buffer = std::move(new_storage);
+        this->buffer = this->owned_buffer.get();
         this->mr = new_mr;
         this->count = new_count;
 
@@ -522,11 +542,11 @@ public:
 
         // Save active data locally before releasing all MR resources.
         // Deregistering old MRs first avoids exhausting provider key slots.
-        std::vector<unsigned char> saved;
-        if(copy_count > 0)
+        std::vector<T> saved;
+        saved.reserve(copy_count);
+        for(size_t i = 0; i < copy_count; i++)
         {
-            saved.resize(copy_count * sizeof(T));
-            std::memcpy(saved.data(), this->buffer, saved.size());
+            saved.push_back(this->buffer[i]);
         }
 
         // Release staging, retired buffers, and old MR before registering new
@@ -537,27 +557,12 @@ public:
         }
         if(this->staging)
         {
-            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
-            std::free(this->staging);
+            this->staging_storage.reset();
             this->staging = nullptr;
         }
         this->staging_size = 0;
         this->staging_next = 0;
         this->staging_active_target = -1;
-
-        for(RetiredBuffer &retired : this->retired_buffers)
-        {
-            if(retired.mr)
-            {
-                ibv_dereg_mr(retired.mr);
-            }
-            if(retired.buffer)
-            {
-                rma_detail::advise_dontneed(retired.buffer, retired.count * sizeof(T));
-                std::free(retired.buffer);
-            }
-        }
-        this->retired_buffers.clear();
 
         if(this->mr)
         {
@@ -566,34 +571,27 @@ public:
         }
         if(this->buffer)
         {
-            rma_detail::advise_dontneed(this->buffer, old_count * sizeof(T));
-            std::free(this->buffer);
+            this->owned_buffer.reset();
             this->buffer = nullptr;
         }
 
         // Allocate and register new buffer with freed MR slots
-        size_t new_alloc_size = new_count * sizeof(T);
-        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
-        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
+        this->owned_buffer =
+            std::make_unique<T[]>(std::max<size_t>(new_count, 1));
+        T *new_buffer = this->owned_buffer.get();
 
-        T *new_buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
-        if(not new_buffer)
-        {
-            throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: aligned_alloc failed");
-        }
-        std::memset(new_buffer, 0, new_aligned_size);
-
-        ibv_mr *new_mr = ibv_reg_mr(this->context.GetPD(), new_buffer, new_aligned_size,
-            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        ibv_mr *new_mr = ibv_reg_mr(this->context.GetPD(), new_buffer,
+            std::max<size_t>(new_count, 1) * sizeof(T),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
         if(not new_mr)
         {
-            std::free(new_buffer);
             throw std::runtime_error("IBVRemoteMemoryAgent::LocalResize: ibv_reg_mr failed");
         }
 
-        if(copy_count > 0)
+        for(size_t i = 0; i < copy_count; i++)
         {
-            std::memcpy(new_buffer, saved.data(), saved.size());
+            new_buffer[i] = saved[i];
         }
 
         this->buffer = new_buffer;
@@ -603,6 +601,7 @@ public:
         if(this->my_agent_rank >= 0 and this->my_agent_rank < static_cast<int>(this->remote_regions.size()))
         {
             this->remote_regions[this->my_agent_rank].addr = reinterpret_cast<uint64_t>(this->buffer);
+            this->remote_regions[this->my_agent_rank].count = this->count;
             this->remote_regions[this->my_agent_rank].rkey = this->BufferRkey();
         }
 
@@ -625,6 +624,7 @@ public:
             throw std::runtime_error("IBVRemoteMemoryAgent::UpdateRemoteInfo: peer rank is out of range");
         }
         this->remote_regions[peer_rank].addr = info.addr;
+        this->remote_regions[peer_rank].count = info.count;
         this->remote_regions[peer_rank].rkey = static_cast<uint32_t>(info.rkey);
     }
 
@@ -634,7 +634,7 @@ public:
         {
             throw std::runtime_error("IBVRemoteMemoryAgent::Replace: cannot replace user-supplied memory");
         }
-        this->context.DrainCompletions();
+        this->QuiesceAgentCommBeforeDeregister();
 
         if(this->staging_mr)
         {
@@ -643,8 +643,7 @@ public:
         }
         if(this->staging)
         {
-            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
-            std::free(this->staging);
+            this->staging_storage.reset();
             this->staging = nullptr;
         }
         this->staging_size = 0;
@@ -658,24 +657,19 @@ public:
         }
         if(this->buffer)
         {
-            rma_detail::advise_dontneed(this->buffer, this->count * sizeof(T));
-            std::free(this->buffer);
+            this->owned_buffer.reset();
             this->buffer = nullptr;
         }
         this->count = 0;
 
-        size_t new_alloc_size = new_count * sizeof(T);
-        if(new_alloc_size == 0) new_alloc_size = sizeof(T);
-        size_t new_aligned_size = ((new_alloc_size + 63) / 64) * 64;
+        this->owned_buffer =
+            std::make_unique<T[]>(std::max<size_t>(new_count, 1));
+        this->buffer = this->owned_buffer.get();
 
-        this->buffer = static_cast<T*>(std::aligned_alloc(64, new_aligned_size));
-        if(not this->buffer and new_count > 0)
-        {
-            throw std::runtime_error("IBVRemoteMemoryAgent::Replace: aligned_alloc failed");
-        }
-        std::memset(this->buffer, 0, new_aligned_size);
-
-        this->mr = ibv_reg_mr(this->context.GetPD(), this->buffer, new_aligned_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        this->mr = ibv_reg_mr(this->context.GetPD(), this->buffer,
+            std::max<size_t>(new_count, 1) * sizeof(T),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
         if(not this->mr)
         {
             throw std::runtime_error("IBVRemoteMemoryAgent::Replace: ibv_reg_mr failed");
@@ -700,8 +694,7 @@ public:
         }
         if(this->staging)
         {
-            rma_detail::advise_dontneed(this->staging, this->staging_size * sizeof(T));
-            std::free(this->staging);
+            this->staging_storage.reset();
             this->staging = nullptr;
         }
         if(this->scratch_mr)
@@ -724,25 +717,10 @@ public:
         {
             if(this->owns_memory)
             {
-                rma_detail::advise_dontneed(this->buffer, this->count * sizeof(T));
-                std::free(this->buffer);
+                this->owned_buffer.reset();
             }
             this->buffer = nullptr;
         }
-
-        for(RetiredBuffer &retired : this->retired_buffers)
-        {
-            if(retired.mr)
-            {
-                ibv_dereg_mr(retired.mr);
-            }
-            if(retired.buffer)
-            {
-                rma_detail::advise_dontneed(retired.buffer, retired.count * sizeof(T));
-                std::free(retired.buffer);
-            }
-        }
-        this->retired_buffers.clear();
 
         this->count = 0;
         this->staging_size = 0;
@@ -762,27 +740,48 @@ private:
     MPI_Comm agent_comm;
     int my_agent_rank;
     std::vector<int> rank_map;
+    std::unique_ptr<T[]> owned_buffer;
     T *buffer;
     ibv_mr *mr;
     uint64_t *scratch;
     ibv_mr *scratch_mr;
+    mutable std::unique_ptr<T[]> staging_storage;
     mutable T *staging;
     mutable ibv_mr *staging_mr;
     mutable size_t staging_size;
     mutable size_t staging_next;
     mutable int staging_active_target;
     std::vector<IBVRemoteRegion> remote_regions;
-    struct RetiredBuffer
-    {
-        T *buffer;
-        ibv_mr *mr;
-        size_t count;
-    };
-    std::vector<RetiredBuffer> retired_buffers;
     bool freed;
     bool owns_memory;
 
     static constexpr size_t DIRECT_REG_BYTE_THRESHOLD = 8192;
+
+    void ValidateRemoteRange(const IBVRemoteRegion &remote, int target_rank,
+                             size_t target_disp, size_t transfer_count,
+                             const char *operation) const
+    {
+        if(target_disp <= remote.count and transfer_count <= remote.count - target_disp)
+        {
+            return;
+        }
+
+        int world_target = -1;
+        if(target_rank >= 0 and target_rank < static_cast<int>(this->rank_map.size()))
+        {
+            world_target = this->rank_map[target_rank];
+        }
+        throw std::runtime_error(
+            std::string("IBVRemoteMemoryAgent::") + operation +
+            ": remote range exceeds registered MR"
+            " target_rank=" + std::to_string(target_rank) +
+            " world_target=" + std::to_string(world_target) +
+            " target_disp=" + std::to_string(target_disp) +
+            " transfer_count=" + std::to_string(transfer_count) +
+            " remote_count=" + std::to_string(remote.count) +
+            " remote_addr=" + std::to_string(remote.addr) +
+            " remote_rkey=" + std::to_string(remote.rkey));
+    }
 
     uint32_t BufferLkey() const {return this->mr->lkey;}
     uint32_t ScratchLkey() const {return this->scratch_mr->lkey;}
@@ -844,6 +843,32 @@ private:
         MPI_Allgather(&world_rank, 1, MPI_INT, this->rank_map.data(), 1, MPI_INT, this->agent_comm);
     }
 
+    // Inbound RDMA writes do not generate CQEs on this rank. DrainCompletions
+    // only waits for our outbound signaled WRs, so a peer can still be writing
+    // into this MR. Fence every peer QP, then barrier, then it is safe to
+    // ibv_dereg_mr.
+    void QuiesceAgentCommBeforeDeregister()
+    {
+        this->context.DrainCompletions();
+        for(size_t i = 0; i < this->remote_regions.size(); ++i)
+        {
+            if(static_cast<int>(i) == this->my_agent_rank)
+            {
+                continue;
+            }
+            const IBVRemoteRegion &remote = this->remote_regions[i];
+            if(remote.addr == 0)
+            {
+                continue;
+            }
+            int world_target = this->rank_map[i];
+            this->context.PostRDMARead(world_target, this->scratch, 1, this->ScratchLkey(),
+                                       remote.addr, remote.rkey, true);
+        }
+        this->context.DrainCompletions();
+        MPI_Barrier(this->agent_comm);
+    }
+
     bool IsInBuffer(const T *ptr, size_t n) const
     {
         auto buf_begin = reinterpret_cast<uintptr_t>(this->buffer);
@@ -866,7 +891,8 @@ private:
         }
         if(this->staging)
         {
-            std::free(this->staging);
+            this->staging_storage.reset();
+            this->staging = nullptr;
         }
 
         size_t new_size = std::max(required_count, this->count);
@@ -875,17 +901,11 @@ private:
         {
             new_size = std::max(new_size, this->staging_size * 2);
         }
-        size_t alloc_bytes = new_size * sizeof(T);
-        size_t aligned_bytes = ((alloc_bytes + 63) / 64) * 64;
+        this->staging_storage = std::make_unique<T[]>(new_size);
+        this->staging = this->staging_storage.get();
 
-        this->staging = static_cast<T*>(std::aligned_alloc(64, aligned_bytes));
-        if(not this->staging)
-        {
-            throw std::runtime_error("IBVRemoteMemoryAgent: aligned_alloc failed for staging");
-        }
-        std::memset(this->staging, 0, aligned_bytes);
-
-        this->staging_mr = ibv_reg_mr(this->context.GetPD(), this->staging, aligned_bytes, IBV_ACCESS_LOCAL_WRITE);
+        this->staging_mr = ibv_reg_mr(this->context.GetPD(), this->staging,
+            new_size * sizeof(T), IBV_ACCESS_LOCAL_WRITE);
         if(not this->staging_mr)
         {
             throw std::runtime_error("IBVRemoteMemoryAgent: ibv_reg_mr failed for staging");
@@ -920,21 +940,14 @@ private:
 
     void AllocateAndRegister(size_t count)
     {
-        size_t alloc_size = count * sizeof(T);
-        if(alloc_size == 0)
-        {
-            alloc_size = sizeof(T);
-        }
+        this->owned_buffer =
+            std::make_unique<T[]>(std::max<size_t>(count, 1));
+        this->buffer = this->owned_buffer.get();
 
-        size_t aligned_size = ((alloc_size + 63) / 64) * 64;
-        this->buffer = static_cast<T*>(std::aligned_alloc(64, aligned_size));
-        if(not this->buffer)
-        {
-            throw std::runtime_error("IBVRemoteMemoryAgent: aligned_alloc failed for buffer");
-        }
-        std::memset(this->buffer, 0, aligned_size);
-
-        this->mr = ibv_reg_mr(this->context.GetPD(), this->buffer, aligned_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+        this->mr = ibv_reg_mr(this->context.GetPD(), this->buffer,
+            std::max<size_t>(count, 1) * sizeof(T),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
         if(not this->mr)
         {
             throw std::runtime_error("IBVRemoteMemoryAgent: ibv_reg_mr failed for buffer");
@@ -957,6 +970,7 @@ private:
     {
         IBVRemoteRegion local_info{};
         local_info.addr = reinterpret_cast<uint64_t>(this->buffer);
+        local_info.count = this->count;
         local_info.rkey = this->BufferRkey();
 
         int size;

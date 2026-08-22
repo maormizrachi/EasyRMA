@@ -129,6 +129,11 @@ public:
         return false;
     }
 
+    virtual bool SupportsShrinkingReallocation() const
+    {
+        return true;
+    }
+
     virtual void SyncLocal()
     {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -139,6 +144,11 @@ public:
     virtual bool SupportsLocalResize() const
     {
         return false;
+    }
+
+    virtual bool UsesVirtualAddresses() const
+    {
+        return true;
     }
 
     virtual RemoteBufferInfo LocalResize(size_t new_count)
