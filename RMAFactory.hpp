@@ -208,6 +208,33 @@ public:
         }
     }
 
+    // Destroy shared provider contexts while MPI and accelerator runtimes are
+    // still alive. Leaving these function-local statics to process teardown
+    // makes libfabric free CXI resources after MPI_Finalize.
+    static void Finalize(RDMA_Type type)
+    {
+        if(type == RDMA_Type::AUTO_RDMA)
+        {
+            type = ResolveAutoRDMA();
+        }
+
+        switch(type)
+        {
+            case RDMA_Type::OFI_RDMA:
+#ifdef __WITH_OFI
+                GetSharedOFIContext().reset();
+#endif
+                break;
+            case RDMA_Type::IBV_RDMA:
+#ifdef __WITH_IBV
+                GetSharedIBVContext().reset();
+#endif
+                break;
+            default:
+                break;
+        }
+    }
+
     template<typename T>
     static std::unique_ptr<RemoteMemoryAgent<T>> Create(RDMA_Type type, size_t count, MPI_Comm comm)
     {
