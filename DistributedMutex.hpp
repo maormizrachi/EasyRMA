@@ -25,8 +25,21 @@ public:
     void Destroy(void);
 
 private:
+    static const size_t INTENT_SLOT = 0;
+    static const size_t TURN_SLOT = 1;
+    static const size_t SLOTS_NUM = 2;
+    static const rank_t TURN_HOLDER = 0;
+
+    void PublishIntent(uint64_t value);
+
+    void PublishTurn(rank_t turnRank);
+
+    void ReadPeerIntentAndTurn(uint64_t &peerIntent, rank_t &turnRank);
+
     MPI_Comm comm;
     rank_t rank;
+    rank_t myRank;
+    rank_t peerRank;
     std::unique_ptr<RemoteMemoryAgent<uint64_t>> agent;
     bool destroyed;
 };

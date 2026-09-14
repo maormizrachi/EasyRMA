@@ -3,21 +3,35 @@
 #include "DistributedMutex.hpp"
 #include <cassert>
 #include <cstdint>
+#include <stdexcept>
+
+namespace
+{
+    const uint64_t NOT_INTERESTED = 0;
+    const uint64_t INTERESTED = 1;
+}
 
 DistributedMutex::DistributedMutex(const MPI_Comm &comm, rank_t rank, RDMA_Type rdma_type):
     comm(comm), rank(rank), destroyed(false)
 {
     assert(this->comm != MPI_COMM_NULL);
-    rank_t my_rank, size;
-    MPI_Comm_rank(this->comm, &my_rank);
+    rank_t size;
+    MPI_Comm_rank(this->comm, &this->myRank);
     MPI_Comm_size(this->comm, &size);
-    assert(size > 1);
-
-    this->agent = RMAFactory::Create<uint64_t>(rdma_type, 1, this->comm);
-
-    if(my_rank == rank and this->agent->GetLocalPointer() != nullptr)
+    if(size != 2)
     {
-        *this->agent->GetLocalPointer() = 0;
+        throw std::runtime_error("DistributedMutex: requires a two-rank communicator");
+    }
+    this->peerRank = 1 - this->myRank;
+
+    this->agent = RMAFactory::Create<uint64_t>(rdma_type, DistributedMutex::SLOTS_NUM, this->comm);
+
+    uint64_t *local = this->agent->GetLocalPointer();
+    if(local != nullptr)
+    {
+        local[DistributedMutex::INTENT_SLOT] = NOT_INTERESTED;
+        local[DistributedMutex::TURN_SLOT] = static_cast<uint64_t>(DistributedMutex::TURN_HOLDER);
+        this->agent->SyncLocal();
     }
 
     MPI_Barrier(this->comm);
@@ -44,17 +58,62 @@ DistributedMutex::~DistributedMutex()
     }
 }
 
+void DistributedMutex::PublishIntent(uint64_t value)
+{
+    uint64_t *local = this->agent->GetLocalPointer();
+    __atomic_store_n(&local[DistributedMutex::INTENT_SLOT], value, __ATOMIC_SEQ_CST);
+    this->agent->SyncLocal();
+}
+
+void DistributedMutex::PublishTurn(rank_t turnRank)
+{
+    uint64_t value = static_cast<uint64_t>(turnRank);
+    if(this->myRank == DistributedMutex::TURN_HOLDER)
+    {
+        uint64_t *local = this->agent->GetLocalPointer();
+        __atomic_store_n(&local[DistributedMutex::TURN_SLOT], value, __ATOMIC_SEQ_CST);
+        this->agent->SyncLocal();
+    }
+    else
+    {
+        // Flushed, so the turn is in place before the peer's intent is read.
+        this->agent->Put(&value, 1, DistributedMutex::TURN_HOLDER, DistributedMutex::TURN_SLOT, true);
+    }
+}
+
+void DistributedMutex::ReadPeerIntentAndTurn(uint64_t &peerIntent, rank_t &turnRank)
+{
+    if(this->myRank == DistributedMutex::TURN_HOLDER)
+    {
+        this->agent->Get(&peerIntent, 1, this->peerRank, DistributedMutex::INTENT_SLOT);
+        uint64_t *local = this->agent->GetLocalPointer();
+        turnRank = static_cast<rank_t>(__atomic_load_n(&local[DistributedMutex::TURN_SLOT], __ATOMIC_SEQ_CST));
+    }
+    else
+    {
+        // The peer's intent word and the turn word are adjacent in the turn
+        // holder's region, so a single round trip reads both.
+        uint64_t values[DistributedMutex::SLOTS_NUM];
+        this->agent->Get(values, DistributedMutex::SLOTS_NUM, this->peerRank, 0);
+        peerIntent = values[DistributedMutex::INTENT_SLOT];
+        turnRank = static_cast<rank_t>(values[DistributedMutex::TURN_SLOT]);
+    }
+}
+
 void DistributedMutex::Lock(void)
 {
-    const uint64_t one = 1;
-    const uint64_t zero = 0;
-    uint64_t old = 0;
     int probe_flag;
+
+    this->PublishIntent(INTERESTED);
+    // Yield the turn, so two simultaneous acquires resolve to a single winner.
+    this->PublishTurn(this->peerRank);
 
     while(true)
     {
-        this->agent->CompareAndSwap(one, zero, old, this->rank, 0);
-        if(old == 0)
+        uint64_t peerIntent = NOT_INTERESTED;
+        rank_t turnRank = this->myRank;
+        this->ReadPeerIntentAndTurn(peerIntent, turnRank);
+        if(peerIntent == NOT_INTERESTED or turnRank != this->peerRank)
         {
             break;
         }
@@ -65,10 +124,7 @@ void DistributedMutex::Lock(void)
 
 void DistributedMutex::Unlock(void)
 {
-    const uint64_t zero = 0;
-    const uint64_t one = 1;
-    uint64_t old;
-    this->agent->CompareAndSwap(zero, one, old, this->rank, 0);
+    this->PublishIntent(NOT_INTERESTED);
 }
 
 void DistributedMutex::MakeProgress(void)
