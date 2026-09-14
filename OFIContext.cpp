@@ -1270,6 +1270,59 @@ void OFIContext::ExchangeAddresses()
     this->peer_connected.assign(this->size, true);
 }
 
+// Round-robin ("circle method") pairing: over slots-1 rounds every rank meets
+// every other rank exactly once, and within a round each rank has exactly one
+// partner. slots must be even; when the job has an odd rank count the extra
+// slot is a placeholder that leaves its partner idle for that round.
+static int TournamentPartner(int rank, int round, int slots)
+{
+    int fixedSlot = slots - 1;
+    if(rank == fixedSlot)
+    {
+        return round;
+    }
+    if(rank == round)
+    {
+        return fixedSlot;
+    }
+
+    int ring = slots - 1;
+    int partner = (2 * round - rank) % ring;
+    if(partner < 0)
+    {
+        partner += ring;
+    }
+    return partner;
+}
+
+static int OFIConnectStageRounds()
+{
+    const char *env_stage = std::getenv("RICH_OFI_CONNECT_STAGE");
+    if(env_stage and env_stage[0] != '\0')
+    {
+        int value = std::atoi(env_stage);
+        if(value > 0)
+        {
+            return value;
+        }
+    }
+    return 8;
+}
+
+static double OFIConnectStallSeconds()
+{
+    const char *env_timeout = std::getenv("RICH_OFI_CONNECT_TIMEOUT");
+    if(env_timeout and env_timeout[0] != '\0')
+    {
+        double value = std::atof(env_timeout);
+        if(value > 0.0)
+        {
+            return value;
+        }
+    }
+    return 180.0;
+}
+
 void OFIContext::EstablishConnections()
 {
     this->peer_eps.assign(this->size, nullptr);
@@ -1288,11 +1341,44 @@ void OFIContext::EstablishConnections()
     MPI_Allgather(local_addr.data(), static_cast<int>(addrlen), MPI_BYTE,
                   all_addrs.data(), static_cast<int>(addrlen), MPI_BYTE, this->comm);
 
-    for(int peer = 0; peer < this->size; ++peer)
+    // Connecting to every peer at once overruns the listen backlog and the CM
+    // event queue past a few hundred ranks: the dropped CONNREQs are never
+    // retried by the provider, so the acceptor waits for FI_CONNECTED events
+    // that can no longer arrive. Walk a pairing schedule instead and
+    // synchronise every stageRounds rounds, which caps both the connections
+    // in flight per rank and the queued events at stageRounds.
+    int total_connections = this->size - 1;
+    int established = 0;
+    int stageRounds = OFIConnectStageRounds();
+    double stallSeconds = OFIConnectStallSeconds();
+    int slots = (this->size % 2 == 0) ? this->size : this->size + 1;
+    int rounds = slots - 1;
+
+    std::vector<char> event_buffer(sizeof(fi_eq_cm_entry) + sizeof(int));
+    std::vector<int> stagePeers;
+    stagePeers.reserve(stageRounds);
+
+    for(int stageBegin = 0; stageBegin < rounds; stageBegin += stageRounds)
     {
-        if(peer == this->rank) continue;
-        if(this->rank < peer)
+        int stageEnd = std::min(stageBegin + stageRounds, rounds);
+
+        stagePeers.clear();
+        for(int round = stageBegin; round < stageEnd; ++round)
         {
+            int peer = TournamentPartner(this->rank, round, slots);
+            if(peer == this->rank or peer >= this->size)
+            {
+                continue;
+            }
+            stagePeers.push_back(peer);
+        }
+
+        for(int peer : stagePeers)
+        {
+            if(this->rank >= peer)
+            {
+                continue;
+            }
             fid_ep *active_ep = this->CreateBoundEndpoint(this->fi);
             ret = fi_connect(active_ep, all_addrs.data() + peer * addrlen,
                              &this->rank, sizeof(this->rank));
@@ -1303,69 +1389,105 @@ void OFIContext::EstablishConnections()
             }
             this->peer_eps[peer] = active_ep;
         }
-    }
 
-    int total_connections = this->size - 1;
-    int established = 0;
+        // Both sides of a pairing raise FI_CONNECTED, so the stage is complete
+        // once one event has arrived for each partner in it.
+        int stageConnected = 0;
+        int stageExpected = static_cast<int>(stagePeers.size());
+        double waited = 0.0;
 
-    std::vector<char> event_buffer(sizeof(fi_eq_cm_entry) + sizeof(int));
-
-    while(established < total_connections)
-    {
-        uint32_t event = 0;
-        std::fill(event_buffer.begin(), event_buffer.end(), 0);
-        auto *entry = reinterpret_cast<fi_eq_cm_entry*>(event_buffer.data());
-        ssize_t rd = fi_eq_sread(this->eq, &event, entry, event_buffer.size(), 5000, 0);
-
-        if(rd == -FI_EAGAIN)
+        while(stageConnected < stageExpected)
         {
-            continue;
-        }
+            uint32_t event = 0;
+            std::fill(event_buffer.begin(), event_buffer.end(), 0);
+            auto *entry = reinterpret_cast<fi_eq_cm_entry*>(event_buffer.data());
+            ssize_t rd = fi_eq_sread(this->eq, &event, entry, event_buffer.size(), 1000, 0);
 
-        if(rd < 0)
-        {
-            fi_eq_err_entry err{};
-            fi_eq_readerr(this->eq, &err, 0);
-            ThrowOFIError("EQ error during connection setup (err=" +
-                          std::to_string(err.err) + ", prov_errno=" +
-                          std::to_string(err.prov_errno) + ")");
-        }
-
-        if(event == FI_CONNREQ)
-        {
-            int peer_rank = -1;
-            if(rd >= static_cast<ssize_t>(sizeof(fi_eq_cm_entry) + sizeof(int)))
+            if(rd == -FI_EAGAIN)
             {
-                std::memcpy(&peer_rank, entry->data, sizeof(int));
+                waited += 1.0;
+                if(waited >= stallSeconds)
+                {
+                    std::string missing;
+                    for(int peer : stagePeers)
+                    {
+                        missing += " " + std::to_string(peer);
+                        if(this->rank < peer)
+                        {
+                            missing += "(connect issued)";
+                        }
+                        else
+                        {
+                            missing += this->peer_eps[peer] ? "(accepted)" : "(no CONNREQ)";
+                        }
+                    }
+                    ThrowOFIError("no connection-manager event for " +
+                                  std::to_string(static_cast<int>(waited)) + "s while connecting rank " +
+                                  std::to_string(this->rank) + " (stage rounds " +
+                                  std::to_string(stageBegin) + "-" + std::to_string(stageEnd - 1) +
+                                  ", " + std::to_string(stageConnected) + "/" +
+                                  std::to_string(stageExpected) + " in this stage, " +
+                                  std::to_string(established) + "/" +
+                                  std::to_string(total_connections) + " overall, pending peers:" +
+                                  (missing.empty() ? " none" : missing) + ")");
+                }
+                continue;
             }
 
-            if(peer_rank < 0 or peer_rank >= this->size)
+            if(rd < 0)
             {
+                fi_eq_err_entry err{};
+                fi_eq_readerr(this->eq, &err, 0);
+                ThrowOFIError("EQ error during connection setup (err=" +
+                              std::to_string(err.err) + ", prov_errno=" +
+                              std::to_string(err.prov_errno) + ")");
+            }
+
+            waited = 0.0;
+
+            if(event == FI_CONNREQ)
+            {
+                int peer_rank = -1;
+                if(rd >= static_cast<ssize_t>(sizeof(fi_eq_cm_entry) + sizeof(int)))
+                {
+                    std::memcpy(&peer_rank, entry->data, sizeof(int));
+                }
+
+                if(peer_rank < 0 or peer_rank >= this->size)
+                {
+                    if(entry->info) fi_freeinfo(entry->info);
+                    ThrowOFIError("CONNREQ with invalid peer rank: " + std::to_string(peer_rank));
+                }
+
+                fid_ep *passive_ep = this->CreateBoundEndpoint(entry->info);
+                ret = fi_accept(passive_ep, nullptr, 0);
+                if(ret != 0)
+                {
+                    fi_close(&passive_ep->fid);
+                    if(entry->info) fi_freeinfo(entry->info);
+                    ThrowOFIError("fi_accept from peer " + std::to_string(peer_rank) + " failed", -ret);
+                }
+                this->peer_eps[peer_rank] = passive_ep;
                 if(entry->info) fi_freeinfo(entry->info);
-                ThrowOFIError("CONNREQ with invalid peer rank: " + std::to_string(peer_rank));
             }
-
-            fid_ep *passive_ep = this->CreateBoundEndpoint(entry->info);
-            ret = fi_accept(passive_ep, nullptr, 0);
-            if(ret != 0)
+            else if(event == FI_CONNECTED)
             {
-                fi_close(&passive_ep->fid);
-                if(entry->info) fi_freeinfo(entry->info);
-                ThrowOFIError("fi_accept from peer " + std::to_string(peer_rank) + " failed", -ret);
+                stageConnected++;
+                established++;
             }
-            this->peer_eps[peer_rank] = passive_ep;
-            if(entry->info) fi_freeinfo(entry->info);
         }
-        else if(event == FI_CONNECTED)
+
+        MPI_Barrier(this->comm);
+
+        int stageIndex = stageBegin / stageRounds;
+        if(this->rank == 0 and (stageEnd == rounds or stageIndex % 16 == 0))
         {
-            established++;
+            fprintf(stderr, "[OFI] MSG mode: %d/%d connection rounds done\n", stageEnd, rounds);
         }
     }
 
     this->peer_connected.assign(this->size, true);
     this->peer_connected[this->rank] = false;
-
-    MPI_Barrier(this->comm);
 
     if(this->rank == 0)
     {
