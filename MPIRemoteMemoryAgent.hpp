@@ -134,11 +134,15 @@ public:
     {
         MPI_Datatype dt = detail::AtomicMPIType(sizeof(T));
         size_t byte_offset = target_disp * sizeof(T);
-        T old_value;
-        MPI_Fetch_and_op(&addend, &old_value, dt, target_rank, static_cast<MPI_Aint>(byte_offset), MPI_SUM, this->win);
+        T old_value{};
+        detail::CheckMPIError(MPI_Fetch_and_op(&addend, &old_value, dt, target_rank, static_cast<MPI_Aint>(byte_offset), MPI_SUM, this->win), "MPIRemoteMemoryAgent::FetchAndAdd MPI_Fetch_and_op");
         if(flush)
         {
-            MPI_Win_flush(target_rank, this->win);
+            detail::CheckMPIError(MPI_Win_flush(target_rank, this->win), "MPIRemoteMemoryAgent::FetchAndAdd MPI_Win_flush");
+        }
+        else
+        {
+            detail::CheckMPIError(MPI_Win_flush_local(target_rank, this->win), "MPIRemoteMemoryAgent::FetchAndAdd MPI_Win_flush_local");
         }
         return old_value;
     }
